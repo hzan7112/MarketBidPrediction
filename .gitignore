@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+.venv/
+venv/
+env/
+*.env
+
+# IDE
+.vscode/
+.idea/
+
+# System
+.DS_Store
+Thumbs.db
+
+# Data
+data/raw/
+data/processed/
+
+# Models / large files
+*.pt
+*.pth
+*.pkl
+*.joblib
+
+# Logs
+*.log
+.conda/

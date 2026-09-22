@@ -472,23 +472,48 @@ def main():
                             f"No Stage2 curve samples discovered for test month {mk}"
                         )
 
+                    # Use the merge indicator to distinguish a true sample_id
+                    # join failure from an intentionally shape-less FLAT curve.
                     curve = d.merge(
                         month_shapes,
                         on="sample_id",
                         how="left",
                         validate="one_to_one",
                         sort=False,
+                        indicator="__stage2_merge",
                     )
 
-                    sc = [f"shape_v{i:02d}" for i in range(21)]
+                    joined = curve["__stage2_merge"].eq("both")
 
+                    if not joined.all():
+                        bad = int((~joined).sum())
+                        raise ValueError(
+                            f"{bad} test rows in {src.name} have no Stage2 sample_id join."
+                        )
+
+                    sc = [f"shape_v{i:02d}" for i in range(21)]
+                    flat = norm(curve["y_template_id"]).eq("FLAT")
                     shape_ok = curve[sc].notna().all(axis=1)
 
-                    if not shape_ok.all():
-                        bad = int((~shape_ok).sum())
+                    # Stage2 intentionally stores FLAT curves with NaN shape_v00..20.
+                    # For every non-FLAT row, however, all 21 shape values must exist.
+                    nonflat_bad = (~flat) & (~shape_ok)
+
+                    if nonflat_bad.any():
+                        bad = int(nonflat_bad.sum())
                         raise ValueError(
-                            f"{bad} test rows in {src.name} have no Stage2 shape join."
+                            f"{bad} non-FLAT test rows in {src.name} "
+                            "joined Stage2 by sample_id but have incomplete shape_v00..shape_v20."
                         )
+
+                    # 04c interprets a FLAT curve as a zero normalized price shape.
+                    # Materialize that representation in the frozen test set.
+                    if flat.any():
+                        curve.loc[flat, sc] = 0.0
+
+                    curve = curve.drop(
+                        columns="__stage2_merge"
+                    )
 
                     counts["test_curve"] += len(curve)
 
@@ -582,7 +607,7 @@ def main():
     )
 
     manifest = {
-        "version": "frozen-modeling-dataset-v1",
+        "version": "frozen-modeling-dataset-v2-flat-shape-fix",
         "year": args.year,
         "source_dataset": str(source_dir),
         "source_schema": str(schema_file),
