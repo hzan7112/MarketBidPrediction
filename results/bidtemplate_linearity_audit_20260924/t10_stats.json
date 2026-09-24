@@ -1,0 +1,37 @@
+{
+  "t10_rows": 2036624,
+  "sloped_rows": 1857726,
+  "block_rows": 178898,
+  "two_clean_points": 817737,
+  "two_clean_points_sloped": 817737,
+  "two_clean_points_after_collapsing_duplicates": 0,
+  "p_span_le_1": 219167,
+  "p_span_le_5": 973897,
+  "p_span_relative_le_1pct": 297587,
+  "p_span_quantiles": {
+    "0.0": 0.01,
+    "0.1": 0.91,
+    "0.25": 2.44,
+    "0.5": 5.4,
+    "0.75": 15.67,
+    "0.9": 51.11,
+    "1.0": 998.64
+  },
+  "sentinel_quantity_rows": 0,
+  "clean_point_distribution": {
+    "2": 817737,
+    "3": 132211,
+    "4": 342069,
+    "5": 180776,
+    "6": 142537,
+    "7": 156239,
+    "8": 53932,
+    "9": 133148,
+    "10": 56593,
+    "11": 6929,
+    "13": 3417,
+    "14": 205,
+    "15": 3501,
+    "19": 7330
+  }
+}

@@ -1,0 +1,23 @@
+Final strategy-profile validation - 2025
+============================================================================
+
+Profile definition:
+  9 independent long-term strategy dimensions.
+  KMeans is auxiliary natural-pattern discovery only.
+  Cluster validation uses complete cases only; no imputation.
+
+Participants: 1,366
+Median LT split-half Spearman: 0.9732
+LT pairs with |Spearman| >= 0.90: 2
+Median ST MAE improvement: 47.94%
+
+Selected cluster solutions from 04:
+  full_9d: K=2, N=544, sil=0.6880, CH=934.9, DB=0.5232, ARI=1.0000, min_cluster=66 (12.13%), median_eps2=0.0044
+  price_adjustment_3d: K=3, N=800, sil=0.5282, CH=767.0, DB=0.6875, ARI=1.0000, min_cluster=70 (8.75%), median_eps2=0.3761
+  quantity_structure_3d: K=5, N=1248, sil=0.8089, CH=4724.2, DB=0.4935, ARI=1.0000, min_cluster=26 (2.08%), median_eps2=0.9836 [small cluster <5%]
+  curve_shape_3d: K=2, N=579, sil=0.8415, CH=2465.1, DB=0.3709, ARI=1.0000, min_cluster=66 (11.40%), median_eps2=0.0005
+
+Important:
+  A small cluster is flagged but not automatically rejected.
+  Compare neighboring K values before deciding whether it is
+  a genuine minority strategy or over-segmentation.

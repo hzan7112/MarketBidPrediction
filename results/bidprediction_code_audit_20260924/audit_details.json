@@ -1,0 +1,9 @@
+{
+  "eligible_rows": 633913,
+  "duplicate_key_rows_within_parts": 0,
+  "history_date_mismatch_rows": 0,
+  "oracle_prediction_nonmonotone_rows": 90,
+  "true_switch_rows": 30710,
+  "history_cutoff_after_rows": 316217,
+  "unchanged_share_of_persistence_absolute_error": 0.8786531818909683
+}
