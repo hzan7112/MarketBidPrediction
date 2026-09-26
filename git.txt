@@ -1,3 +1,4 @@
 git add .
 git commit -m "update"
-git push
+git config --global http.proxy http://127.0.0.1:7897
+git push origin main
