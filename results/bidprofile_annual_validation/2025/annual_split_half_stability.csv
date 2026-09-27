@@ -1,0 +1,10 @@
+﻿feature,name_cn,participants_compared,spearman_h1_h2
+annual_bid_level,报价水平,1194,0.9815162435311018
+annual_adjustment_magnitude,调整幅度,1192,0.9317201644692192
+annual_strategy_persistence,策略持续性,1191,0.814305040616265
+annual_quantity_hhi,容量集中度,1194,0.9735651348341204
+annual_effective_segment_count,有效段数,1194,0.978639176542105
+annual_flat_curve_rate,平价偏好,1194,0.970374943284362
+annual_tail_uplift_ratio,尾部抬价,1194,0.93584231846328
+annual_curve_bend_ratio,曲线弯折,1194,0.7914178295415206
+annual_shape_variability,形态波动,1182,0.9115280146041025

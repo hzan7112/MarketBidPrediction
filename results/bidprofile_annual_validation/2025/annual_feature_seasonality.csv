@@ -1,0 +1,10 @@
+﻿feature,name_cn,participants_with_2plus_months,population_annual_iqr,median_participant_month_abs_deviation,normalized_month_deviation_over_population_iqr
+annual_bid_level,报价水平,1240,79.84600182789653,1.6559228571428593,0.020738957734065457
+annual_adjustment_magnitude,调整幅度,1239,5.744867047794248,0.21875,0.03807746953586845
+annual_strategy_persistence,策略持续性,1239,0.24100122905998278,0.05235933327491854,0.21725753631690745
+annual_quantity_hhi,容量集中度,1240,0.44444444444444453,0.0,0.0
+annual_effective_segment_count,有效段数,1240,3.0,0.0,0.0
+annual_flat_curve_rate,平价偏好,1240,1.0,0.0,0.0
+annual_tail_uplift_ratio,尾部抬价,1240,0.1999999999999951,0.0,0.0
+annual_curve_bend_ratio,曲线弯折,1240,0.00684931506828695,0.0,0.0
+annual_shape_variability,形态波动,1232,6.988191703622977e-05,0.0,0.0

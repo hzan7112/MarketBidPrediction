@@ -1,0 +1,27 @@
+Annual static strategy profile validation - 2025
+==============================================================================
+
+Participants: 1,366
+Ready: 1,240 (90.78%)
+Complete 9D: 1,237 (90.56%)
+Median H1-H2 Spearman: 0.9358
+Median month-vs-annual Spearman: 0.9584
+High-redundancy pairs |rho|>=0.90: 1
+
+Feature review:
+  annual_bid_level: coverage=91.36%, H1H2=0.9815, month-rank=0.9858, norm-month-dev=0.0207, IQR=79.846; no automatic warning
+  annual_adjustment_magnitude: coverage=91.36%, H1H2=0.9317, month-rank=0.9153, norm-month-dev=0.0381, IQR=5.74487; no automatic warning
+  annual_strategy_persistence: coverage=91.07%, H1H2=0.8143, month-rank=0.7548, norm-month-dev=0.2173, IQR=0.241001; no automatic warning
+  annual_quantity_hhi: coverage=91.36%, H1H2=0.9736, month-rank=0.9858, norm-month-dev=0.0000, IQR=0.444444; no automatic warning
+  annual_effective_segment_count: coverage=91.36%, H1H2=0.9786, month-rank=0.9860, norm-month-dev=0.0000, IQR=3; no automatic warning
+  annual_flat_curve_rate: coverage=91.36%, H1H2=0.9704, month-rank=0.9717, norm-month-dev=0.0000, IQR=1; no automatic warning
+  annual_tail_uplift_ratio: coverage=91.36%, H1H2=0.9358, month-rank=0.9584, norm-month-dev=0.0000, IQR=0.2; no automatic warning
+  annual_curve_bend_ratio: coverage=91.36%, H1H2=0.7914, month-rank=0.7943, norm-month-dev=0.0000, IQR=0.00684932; no automatic warning
+  annual_shape_variability: coverage=90.85%, H1H2=0.9115, month-rank=0.8833, norm-month-dev=0.0000, IQR=6.98819e-05; no automatic warning
+
+High-redundancy pairs:
+  annual_effective_segment_count <-> annual_flat_curve_rate: rho=-0.9278, n=1248
+
+Important:
+  Flags are audit aids only; they do not automatically delete a feature.
+  A 2025 full-year profile used on 2025 is retrospective/explanatory only.
