@@ -1,0 +1,4 @@
+﻿feature_1,feature_2,n,spearman,abs_spearman
+cand_lt_curve_type_count,cand_lt_intraday_switch_rate,651,0.9616987549617335,0.9616987549617335
+cand_lt_curve_type_count,cand_lt_intraday_price_range,652,0.7127501095590244,0.7127501095590244
+cand_lt_intraday_switch_rate,cand_lt_intraday_price_range,651,0.6782798989162607,0.6782798989162607

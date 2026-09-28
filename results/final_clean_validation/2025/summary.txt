@@ -1,23 +1,42 @@
-Final strategy-profile validation - 2025
-============================================================================
+Final strategy-profile validation - target 2025, season baseline 2025
+========================================================================================
 
-Profile definition:
-  9 independent long-term strategy dimensions.
-  KMeans is auxiliary natural-pattern discovery only.
-  Cluster validation uses complete cases only; no imputation.
+Formal definition:
+  9 annual LT + 9 ST + 8 Strategy Break = 26.
+  Scalar ST references:
+    bid_level / adjustment_bias / adjustment_magnitude -> seasonal baseline
+    quantity_hhi / segment_count / flat / tail / bend -> earlier 60-day baseline
+  Shape ST:
+    recent 7-day shape prototype vs earlier 60-day shape prototype
+  Break:
+    practical-zero reference scale + nonzero recent shift only
 
-Participants: 1,366
-Median LT split-half Spearman: 0.9732
-LT pairs with |Spearman| >= 0.90: 2
-Median ST MAE improvement: 47.94%
+Profile participants: 652
+ST participant-days: 216,103
+Median formal LT split-half Spearman: 0.9501
+Formal LT pairs with |Spearman| >= 0.90: 0
+Median recent-vs-selected improvement (3 seasonal scalar ST): 3.97%
+Median recent-vs-selected improvement (5 rolling scalar ST): 46.96%
+Shape recent-vs-long improvement: 42.46%
+adjustment_magnitude A/B: seasonal MAE=8.75791, earlier60 MAE=11.8425, lower=seasonal
+Strategy-break-any rate: 11.72%
+Overall scalar z clip rate: 1.630%
 
-Selected cluster solutions from 04:
-  full_9d: K=2, N=544, sil=0.6880, CH=934.9, DB=0.5232, ARI=1.0000, min_cluster=66 (12.13%), median_eps2=0.0044
-  price_adjustment_3d: K=3, N=800, sil=0.5282, CH=767.0, DB=0.6875, ARI=1.0000, min_cluster=70 (8.75%), median_eps2=0.3761
-  quantity_structure_3d: K=5, N=1248, sil=0.8089, CH=4724.2, DB=0.4935, ARI=1.0000, min_cluster=26 (2.08%), median_eps2=0.9836 [small cluster <5%]
-  curve_shape_3d: K=2, N=579, sil=0.8415, CH=2465.1, DB=0.3709, ARI=1.0000, min_cluster=66 (11.40%), median_eps2=0.0005
+Important validation files:
+  st_reference_ab_comparison.csv
+  st_selected_reference_validation.csv
+  shape_reference_validation.csv
+  st_z_diagnostics.csv
+  break_event_summary.csv
 
-Important:
-  A small cluster is flagged but not automatically rejected.
-  Compare neighboring K values before deciding whether it is
-  a genuine minority strategy or over-segmentation.
+Interpretation:
+  Use st_reference_ab_comparison.csv to decide whether any of the
+  three price-related dimensions should switch between seasonal and
+  earlier-60d reference. The comparison is computed on common rows.
+  Do not use stale st_seasonal_incremental_signal.csv from older runs.
+
+Selected formal-LT cluster solutions:
+  full_9d: K=2, N=529, sil=0.6572, ARI=1.0000, min_cluster=64 (12.10%)
+  price_adjustment_3d: K=2, N=560, sil=0.5270, ARI=0.9952, min_cluster=82 (14.64%)
+  quantity_structure_3d: K=6, N=652, sil=0.6066, ARI=1.0000, min_cluster=30 (4.60%) [small cluster <5%]
+  curve_shape_3d: K=2, N=579, sil=0.8444, ARI=1.0000, min_cluster=66 (11.40%)

@@ -1,1637 +1,2065 @@
-# PJM_BidProfile Final Clean Pipeline
+# MarketBidPrediction / bidprofile
 
-> 文档基准：`scripts/` 目录中的当前实现（2026-09-18）  
-> 默认数据年度：2025  
-> 日级入口脚本：`01_build_daily_strategy_core_v3.py`
+## 1. 模块定位
 
-本项目把 PJM 发电侧能量市场报价曲线压缩为可解释的主体策略特征，并分别构建长期画像、短期状态、策略突变、辅助聚类发现、验证结果和中文图表。
+`scripts/bidprofile` 用于从一个完整历史参考周期的报价行为中构建**主体多时间尺度策略画像**。其核心目标不是直接利用历史报价曲线预测下一条报价，而是先把历史行为压缩为低维、可解释、可复用的主体策略先验。
 
-完整的主体报价策略画像由三部分组成：
+当前主体级策略画像定义为：
 
 $$
 \boxed{
-\Pi_{i,d}^{strategy}
-=
+Z_i=
 \left[
 Z_i^{LT},
-Z_{i,d}^{ST},
-E_{i,d}^{break}
+Z_i^{STH},
+Z_i^{SEA},
+Z_i^{ID},
+Z_i^{TR}
 \right]
 }
 $$
 
-| 组成部分 | 维数 | 数据粒度 | 回答的问题 |
-|---|---:|---|---|
-| 长期静态画像 $Z_i^{LT}$ | 9 | 主体级 | 这个主体平时怎么报价？ |
-| 短期动态状态 $Z_{i,d}^{ST}$ | 9 | 主体 × 日期 | 最近相对自己的长期习惯发生了什么变化？ |
-| 突变事件 $E_{i,d}^{break}$ | 8 | 主体 × 日期 | 哪些在长期基线窗口内稳定的策略维度近期被打破？ |
+其中：
 
-因此，供后续预测模型使用的完整策略画像输入共有：
+| 画像组成 | 符号 | 当前维数 | 含义 |
+|---|---:|---:|---|
+| 长期稳定策略 | $Z_i^{LT}$ | 9 | 主体在完整历史周期内长期如何报价 |
+| 历史短期策略倾向 | $Z_i^{STH}$ | 8 | 主体历史上出现短周期偏移、异常和形态迁移的典型程度 |
+| 季节性策略摘要 | $Z_i^{SEA}$ | 6 | 主体不同月份相对全年习惯的变化幅度 |
+| 日内策略摘要 | $Z_i^{ID}$ | 5 | 主体不同交易时段相对全年习惯的变化幅度及日内切换频率 |
+| 策略转换特征 | $Z_i^{TR}$ | 5 | 历史报价模板偏好、惯性、切换频率和状态转移复杂度 |
 
-$$
-\boxed{9\ LT+9\ ST+8\ Break=26\text{ 个策略画像变量}}
-$$
-
-其中长期特征是“慢变量”，短期特征是“动态状态”，Strategy Break 是“突变事件”。如果只讨论不会随日期快速变化的主体静态画像，则仅指 9 个 LT；如果讨论主体在日期 $d$ 的完整报价策略表示，则必须使用上述 26 维输入。
-
-每个长期特征另外保留三种表达：
+当历史模板 assignment 已生成时，主体级默认画像维数为：
 
 $$
-\boxed{\text{原始连续值}+\text{经验百分位}+\text{独立状态}}
+\boxed{
+9+8+6+5+5=33
+}
 $$
 
-其中独立状态为“低 / 中 / 高”。这些百分位和状态用于解释与展示，不额外计入上述 26 个原始策略变量。
+这 33 维是当前工程实现的基础候选集，不表示后续预测阶段必须永久固定为 33 维。后续仍应根据稳定性、缺失率、冗余性、模板区分能力和最终曲线预测增量进行筛选。
 
-KMeans 只对 9 个长期特征做辅助自然组合发现，不属于 26 维画像输入，也不再定义主体画像本身或构造旧版 `3×4×2` 交叉类型。
+除主体级 $Z_i$ 外，还保留两个**历史条件画像表**：
+
+$$
+\boxed{
+Z^{SEA}_{i,m}
+}
+$$
+
+表示主体 $i$ 在历史月份 $m$ 的典型季节性偏移；
+
+$$
+\boxed{
+Z^{ID}_{i,h}
+}
+$$
+
+表示主体 $i$ 在历史交易时段 $h$ 的典型日内偏移。
+
+未来预测某个时段 $t$ 时，仅根据目标时点已知的月份和交易时段从历史表中查找对应画像，不要求使用预测年度已经发生的近期报价：
+
+$$
+\boxed{
+X_{i,t}
+=
+\left[
+Z_i,\,
+Z^{SEA}_{i,m(t)},\,
+Z^{ID}_{i,h(t)},\,
+M_t,\,
+U_{i,t},\,
+C_t
+\right]
+}
+$$
+
+其中 $M_t$ 为市场环境，$U_{i,t}$ 为主体物理状态，$C_t$ 为日历特征。
 
 ---
 
-## 1. 当前代码流程
+# 2. 当前代码流程
 
 ```text
-PJM 原始报价 CSV
-        |
-        v
-01_build_daily_strategy_core_v3.py
-        |  时段报价曲线 -> 日级核心行为
-        v
+历史 PJM 报价
+    │
+    ▼
+01_build_daily_strategy_core.py
+    │  时段级报价行为原子
+    │  日级聚合
+    │  participant × slot 历史统计
+    ▼
 02_build_long_term_strategy_profile.py
-        |  日级行为 -> 9 个长期连续策略维度
-        v
-03_build_short_term_strategy_state_fast.py
-        |  日级行为 -> 8 个短期标量状态
-        |            + 1 个形态迁移状态
-        |            + Strategy Break
-        v
-04_build_strategy_profile_v3_complete_case.py
-        |  9 个维度分别生成：原值 + 百分位 + 低/中/高状态
-        |  complete-case KMeans 仅做四个空间的自然聚类发现
-        v
-05_validate_final_strategy_profile_v3_fast.py
-        |  LT 稳定性、特征冗余、ST 增量信息、状态覆盖
-        |  候选 K、聚类质量、规模和逐特征分离度复核
-        v
-06_visualize_final_strategy_profile.py
-        |  9 维长期特征独立画像图 + 被接受的自然聚类图
-        v
-完整 26 维动态策略画像输入、验证表与中文图表
+    │  9 个长期稳定策略特征
+    ▼
+03_build_historical_short_term_tendency.py
+    │  历史年度内部 recent7d vs earlier60d
+    │  汇总为 8 个主体级短期策略倾向
+    ▼
+04_build_seasonal_intraday_strategy_profile.py
+    │  participant × month 季节条件画像
+    │  participant × slot 日内条件画像
+    │  6 个季节摘要 + 5 个日内摘要
+    ▼
+bidtemplate
+    │  历史报价 → template_id
+    ▼
+05_build_strategy_transition_profile.py
+    │  5 个模板/策略转换特征
+    ▼
+06_build_final_strategy_profile.py
+    │  合并为最终主体级 Z_i
+    ▼
+07_validate_strategy_profile.py
+    │  稳定性 / 覆盖率 / 冗余性
+    ▼
+08_visualize_strategy_profile.py
 ```
 
-当前脚本顺序：
+当前主脚本：
 
 ```text
-scripts/01_build_daily_strategy_core_v3.py
-scripts/02_build_long_term_strategy_profile.py
-scripts/03_build_short_term_strategy_state_fast.py
-scripts/04_build_strategy_profile_v3_complete_case.py
-scripts/05_validate_final_strategy_profile_v3_fast.py
-scripts/06_visualize_final_strategy_profile.py
-scripts/strategy_core.py
+scripts/bidprofile/
+├─ 01_build_daily_strategy_core.py
+├─ 02_build_long_term_strategy_profile.py
+├─ 03_build_historical_short_term_tendency.py
+├─ 04_build_seasonal_intraday_strategy_profile.py
+├─ 05_build_strategy_transition_profile.py
+├─ 06_build_final_strategy_profile.py
+├─ 07_validate_strategy_profile.py
+├─ 08_visualize_strategy_profile.py
+├─ strategy_core.py
+└─ README_PJM_BidProfile.md
 ```
-
-`strategy_core.py` 统一维护 9 个 LT 特征、三个 3 维子空间、8 个日级标量映射、21 点形态列及公共函数。
 
 ---
 
-## 2. 01：构建日级策略核心
+# 3. 统一符号
 
-脚本：
+设主体为 $i$，历史日期为 $d$，日内报价时段为 $t$。
 
-```text
-scripts/01_build_daily_strategy_core_v3.py
-```
-
-默认输入：
-
-```text
-data/raw/energy_market_offers/2025/*.csv
-```
-
-默认输出：
-
-```text
-data/processed/final_clean/daily/2025/daily_strategy_core_2025.csv
-```
-
-默认参数：
-
-```text
---year 2025
---raw-root data/raw/energy_market_offers
---out-root data/processed/final_clean/daily
---chunksize 100000
---same-slot-window 30
---min-same-slot-history 5
-```
-
-### 2.1 报价曲线清洗
-
-报价点先按 MW 排序；同一个 MW 对应多个价格时保留最高价格。设清洗后的点为：
+某时段清洗后的报价点为：
 
 $$
-(q_1,p_1),(q_2,p_2),\ldots,(q_m,p_m)
+(q_{i,t,1},p_{i,t,1}),
+\ldots,
+(q_{i,t,m},p_{i,t,m})
+$$
+
+并满足：
+
+$$
+q_{i,t,1}<q_{i,t,2}<\cdots<q_{i,t,m}
 $$
 
 数量轴归一化为：
 
 $$
-x_j=\frac{q_j-q_1}{q_m-q_1}
+x_j
+=
+\frac{
+q_j-q_1
+}{
+q_m-q_1
+},
+\qquad
+x_j\in[0,1]
 $$
 
-斜坡报价使用梯形积分计算容量加权价格水平，阶梯报价使用左端价格积分。单点曲线或零容量跨度曲线按单段曲线处理。
+定义：
 
-### 2.2 时段核心特征
+$$
+\Delta x_j=x_{j+1}-x_j
+$$
 
-| 特征 | 当前实现含义 |
+固定 shape 网格：
+
+$$
+\mathcal G
+=
+\{0,0.05,0.10,\ldots,1.00\}
+$$
+
+历史参考年度的有效日期集合记为：
+
+$$
+\mathcal D_i
+$$
+
+主体 $i$ 在月份 $m$ 的有效日期集合记为：
+
+$$
+\mathcal D_{i,m}
+$$
+
+主体 $i$ 在本地交易时段 $h$ 的历史报价集合记为：
+
+$$
+\mathcal T_{i,h}
+$$
+
+---
+
+# 4. 01：时段级策略原子
+
+脚本：
+
+```text
+01_build_daily_strategy_core.py
+```
+
+## 4.1 报价点清洗
+
+当前技术验证采用：
+
+| 规则 | 实现 |
 |---|---|
-| `bid_level` | 归一化数量轴上的容量加权报价水平 |
-| `adjustment_bias` | 当前报价水平减去该主体相同时槽历史报价水平中位数 |
-| `adjustment_magnitude` | `abs(adjustment_bias)` |
-| `quantity_hhi` | 归一化容量区间份额平方和 |
-| `effective_segment_count` | 价格实际发生变化的次数加 1 |
-| `flat_curve_flag` | 首尾价差在数值容差内是否为 0 |
-| `tail_uplift_ratio` | 最后 20% 容量区间的相对抬价程度 |
-| `curve_bend_ratio` | 尾部涨幅与头部涨幅之差相对总价差的比例 |
-| `shape_v00 ... shape_v20` | 归一化数量网格上的 21 点相对曲线形态 |
+| 有效报价点 | MW 与 BID 同时为有限值 |
+| MW sentinel | 只有明确知道数据源 sentinel 时才通过 `--mw-sentinel` 删除 |
+| BID = 0 | 保留 |
+| BID < 0 | 保留 |
+| MW 排序 | 升序 |
+| 重复 MW | 同一 MW 下保留最大 BID |
+| 最小有效点数 | 至少 2 个不同 MW 点 |
+| 数量跨度 | $q_m-q_1>0$ |
+| 缺失时段 | 保持缺失，不填 0、不插值 |
+
+当前：
+
+$$
+m<2
+$$
+
+或：
+
+$$
+q_m-q_1\le 10^{-12}
+$$
+
+时，该时段不进入策略特征统计。
+
+---
+
+## 4.2 `bid_level`：整体报价水平
+
+### Sloped 曲线
+
+$$
+\boxed{
+L_{i,t}
+=
+\sum_{j=1}^{m-1}
+\frac{
+p_j+p_{j+1}
+}{2}
+\Delta x_j
+}
+$$
+
+### Block 曲线
+
+$$
+\boxed{
+L_{i,t}
+=
+\sum_{j=1}^{m-1}
+p_j\Delta x_j
+}
+$$
+
+该指标反映完整报价曲线在归一化容量轴上的整体价格水平。
+
+字段：
+
+```text
+bid_level
+```
+
+---
+
+## 4.3 `adjustment_bias` 与 `adjustment_magnitude`
+
+先建立主体同一日内时槽的历史基准。
+
+设当前时槽为 $h(t)$，最近最多 $W=30$ 条同槽历史有效报价水平为：
+
+$$
+\mathcal H_{i,t}^{slot}
+=
+\{
+L_{i,\tau}:
+\tau<t,\,
+h(\tau)=h(t)
+\}
+$$
+
+至少有 5 条历史记录时：
+
+$$
+B_{i,t}^{slot}
+=
+\operatorname{Median}
+\left(
+\mathcal H_{i,t}^{slot}
+\right)
+$$
+
+则：
+
+$$
+\boxed{
+A^{bias}_{i,t}
+=
+L_{i,t}
+-
+B_{i,t}^{slot}
+}
+$$
+
+$$
+\boxed{
+A^{mag}_{i,t}
+=
+\left|
+A^{bias}_{i,t}
+\right|
+}
+$$
+
+对应字段：
+
+```text
+adjustment_bias
+adjustment_magnitude
+```
+
+---
+
+## 4.4 `quantity_hhi`：容量区间集中度
+
+$$
+\boxed{
+HHI^Q_{i,t}
+=
+\sum_{j=1}^{m-1}
+(\Delta x_j)^2
+}
+$$
+
+若容量主要集中在少数大区间，$HHI^Q$ 较高；若容量在多个区间分布较均匀，$HHI^Q$ 较低。
+
+字段：
+
+```text
+quantity_hhi
+```
+
+---
+
+## 4.5 `effective_segment_count`：有效价格段数
+
+当前 01 中按价格实际变化次数定义：
+
+$$
+\boxed{
+K^{eff}_{i,t}
+=
+1
++
+\sum_{j=1}^{m-1}
+\mathbf{1}
+\left(
+|p_{j+1}-p_j|>10^{-9}
+\right)
+}
+$$
+
+字段：
+
+```text
+effective_segment_count
+```
+
+说明：这里是 `bidprofile` 的历史行为原子，不等同于后续 `bidtemplate` 中按照新技术路线进行“近价段合并 + 微小容量段合并”后的最终模板有效阶梯数。
+
+---
+
+## 4.6 `flat_curve_flag`：平价报价标志
+
+当前不再仅比较首尾价格，而是使用整条曲线价格极差：
+
+$$
+\boxed{
+F_{i,t}
+=
+\mathbf{1}
+\left[
+\max_j p_j-\min_j p_j
+\le 10^{-9}
+\right]
+}
+$$
+
+字段：
+
+```text
+flat_curve_flag
+```
+
+---
+
+## 4.7 `tail_uplift_ratio`：尾部抬价程度
+
+在固定网格 $\mathcal G$ 上得到报价函数 $P(x)$。
+
+定义：
+
+$$
+P_0=P(0)
+$$
+
+$$
+P_{0.8}=P(0.8)
+$$
+
+$$
+P_1=P(1)
+$$
+
+则：
+
+$$
+\boxed{
+T_{i,t}
+=
+\frac{
+P_1-P_{0.8}
+}{
+|P_1-P_0|+\varepsilon
+}
+}
+$$
 
 其中：
 
 $$
-HHI_q=\sum_j(\Delta x_j)^2
+\varepsilon=10^{-12}
 $$
 
-$$
-N_{segment}=1+\sum_j\mathbf{1}(|p_{j+1}-p_j|>\varepsilon)
-$$
+字段：
 
-设 21 点曲线在 $x=0,0.2,0.8,1$ 的价格分别为 $p_0,p_{0.2},p_{0.8},p_1$，则：
-
-$$
-TailUplift=\frac{p_1-p_{0.8}}{|p_1-p_0|+\varepsilon}
-$$
-
-$$
-CurveBend=\frac{(p_1-p_{0.8})-(p_{0.2}-p_0)}{|p_1-p_0|+\varepsilon}
-$$
-
-非平价曲线的相对形态定义为：
-
-$$
-S(u)=\frac{p(u)-p_0}{p_1-p_0},\qquad u\in\{0,0.05,\ldots,1\}
-$$
-
-### 2.3 同时槽历史与日级聚合
-
-调整基线按 `(participant_id, local_slot)` 分组，只使用当前记录之前最多 30 个有效报价水平；历史不足 5 条时不计算调整残差。UTC 记录按时间稳定排序，因此不会使用未来报价。
-
-日级表按“主体 × 本地日期”聚合：大多数连续变量取日内中位数，`flat_curve_flag` 取日内均值形成 `daily_flat_curve_rate`，21 个形态点逐点取中位数。
+```text
+tail_uplift_ratio
+```
 
 ---
 
-## 3. 02：构建 9 个长期连续策略维度
+## 4.8 `curve_bend_ratio`：曲线弯折程度
 
-脚本：
+令：
 
-```text
-scripts/02_build_long_term_strategy_profile.py
-```
+$$
+P_{0.2}=P(0.2)
+$$
 
-默认输入与输出：
+头部价格变化：
 
-```text
-data/processed/final_clean/daily/2025/daily_strategy_core_2025.csv
-data/processed/final_clean/long_term/2025/long_term_strategy_profile_2025.csv
-```
+$$
+\Delta P^{head}
+=
+P_{0.2}-P_0
+$$
 
-### 3.1 中文名称、代码字段和顺序
+尾部价格变化：
 
-9 个中文维度与代码字段严格一一对应：
+$$
+\Delta P^{tail}
+=
+P_1-P_{0.8}
+$$
 
-| 顺序 | 中文画像维度 | 正式字段 | 直接日级来源 | 核心问题 |
-|---:|---|---|---|---|
-| 1 | 报价水平 | `lt_bid_level` | `daily_bid_level` | 主体通常报在什么价格水平？ |
-| 2 | 调整幅度 | `lt_adjustment_magnitude` | `daily_adjustment_magnitude` | 相对自身同一时槽历史，通常改动多大？ |
-| 3 | 持续性 | `lt_strategy_persistence` | `daily_adjustment_bias` | 今天的调整方向与幅度是否会延续到次日？ |
-| 4 | 容量集中度 | `lt_quantity_hhi` | `daily_quantity_hhi` | 容量是否集中在少数报价区间？ |
-| 5 | 有效段数 | `lt_effective_segment_count` | `daily_effective_segment_count` | 曲线中有多少个价格真正不同的有效段？ |
-| 6 | 平价偏好 | `lt_flat_curve_rate` | `daily_flat_curve_rate` | 主体多大程度上使用首尾同价曲线？ |
-| 7 | 尾部抬价 | `lt_tail_uplift_ratio` | `daily_tail_uplift_ratio` | 总价差中有多少集中在最后 20% 容量？ |
-| 8 | 曲线弯折 | `lt_curve_bend_ratio` | `daily_curve_bend_ratio` | 尾部涨幅相对头部涨幅有多强？ |
-| 9 | 形态波动 | `lt_shape_variability` | `daily_shape_v00 ... daily_shape_v20` | 去掉绝对价格水平后，曲线形状跨日变化多大？ |
-
-最终长期向量按上表顺序写为：
+则：
 
 $$
 \boxed{
-Z_i^{LT}
+C_{i,t}
 =
-\left[
-L_i^{LT},
-A_i^{mag},
-A_i^{persist},
-H_i^{LT},
-K_i^{LT},
-F_i^{LT},
-T_i^{LT},
-C_i^{LT},
-D_i^{shape}
-\right]
+\frac{
+\Delta P^{tail}
+-
+\Delta P^{head}
+}{
+|P_1-P_0|+\varepsilon
+}
 }
 $$
 
-即：
+字段：
 
 ```text
-Z_i^LT = [
-    报价水平,
-    调整幅度,
-    持续性,
-    容量集中度,
-    有效段数,
-    平价偏好,
-    尾部抬价,
-    曲线弯折,
-    形态波动
-]
+curve_bend_ratio
 ```
 
-### 3.2 统一符号与三层计算关系
+---
 
-为避免公式中的 `daily_xxx` 难以理解，先定义统一符号：
+## 4.9 `shape_v00 ~ shape_v20`：归一化相对形态
 
-- $i$：市场主体；
-- $t$：主体的一条时段报价记录；
-- $d$：本地自然日；
-- $\mathcal T_{i,d}$：主体 $i$ 在日期 $d$ 的有效时段集合；
-- $\mathcal D_i$：主体 $i$ 的有效日期集合；
-- $m$：清洗后报价断点数；
-- $\varepsilon=10^{-12}$：分母数值保护量；
-- $\varepsilon_p=10^{-9}$：判断价格是否变化的容差。
-
-主体 $i$ 在时段 $t$ 的清洗后报价断点为：
+非平价且首尾价格不相等时：
 
 $$
-\mathcal B_{i,t}
+\boxed{
+V_{i,t}(u)
 =
-\left\{(q_{i,t,j},p_{i,t,j})\right\}_{j=1}^{m}
+\frac{
+P_{i,t}(u)-P_{i,t}(0)
+}{
+P_{i,t}(1)-P_{i,t}(0)
+}
+}
 $$
 
-断点按 MW 从小到大排序；同一 MW 有多个价格时保留最高价格。数量跨度大于 0 时，将累计数量归一化：
+其中：
 
 $$
-x_{i,t,j}
+u\in\mathcal G
+$$
+
+得到：
+
+```text
+shape_v00
+...
+shape_v20
+```
+
+若整条曲线 flat，则 shape 不定义；若曲线非 flat 但首尾价格相等，当前端点归一化 shape 同样不定义。
+
+---
+
+# 5. 01：日级策略特征
+
+对每个：
+
+```text
+participant_id × local_date
+```
+
+进行日级聚合。
+
+## 5.1 日级基础特征
+
+| 日级字段 | 公式 / 聚合方式 |
+|---|---|
+| `daily_bid_level` | $\operatorname{Median}_t(L_{i,t})$ |
+| `daily_adjustment_bias` | $\operatorname{Median}_t(A^{bias}_{i,t})$ |
+| `daily_adjustment_magnitude` | $\operatorname{Median}_t(A^{mag}_{i,t})$ |
+| `daily_quantity_hhi` | $\operatorname{Median}_t(HHI^Q_{i,t})$ |
+| `daily_effective_segment_count` | $\operatorname{Median}_t(K^{eff}_{i,t})$ |
+| `daily_flat_curve_rate` | $\operatorname{Mean}_t(F_{i,t})$ |
+| `daily_tail_uplift_ratio` | $\operatorname{Median}_t(T_{i,t})$ |
+| `daily_curve_bend_ratio` | $\operatorname{Median}_t(C_{i,t})$ |
+| `daily_shape_v00~20` | 每个 shape 坐标分别取日内中位数 |
+
+此外保留：
+
+```text
+daily_valid_interval_count
+daily_shape_defined_interval_count
+```
+
+作为数据质量字段。
+
+---
+
+## 5.2 `daily_curve_type_count`：日内不同报价曲线数量
+
+当前 01 使用清洗后的完整：
+
+```text
+curve_mode + q sequence + p sequence
+```
+
+生成精确 `curve_key`。
+
+一天内有效报价曲线 key 集合为：
+
+$$
+\mathcal K_{i,d}
+$$
+
+则：
+
+$$
+\boxed{
+K^{curve}_{i,d}
 =
-\frac{q_{i,t,j}-q_{i,t,1}}
-{q_{i,t,m}-q_{i,t,1}}
-\in[0,1]
+|\mathcal K_{i,d}|
+}
 $$
 
-并记区间容量份额为：
+字段：
+
+```text
+daily_curve_type_count
+```
+
+注意：该 key 仅用于 `bidprofile` 的日内行为原子，不等同于 `bidtemplate` 的报价策略模板 ID。
+
+---
+
+## 5.3 `daily_curve_switch_count`：日内曲线切换次数
+
+按时间排序后的有效曲线 key 为：
 
 $$
-\Delta x_{i,t,j}=x_{i,t,j+1}-x_{i,t,j}
+k_1,k_2,\ldots,k_N
 $$
 
-由断点构造报价函数 $P_{i,t}(x)$。在区间 $x\in[x_{i,t,j},x_{i,t,j+1})$ 上：
+则：
 
 $$
-P_{i,t}(x)
+\boxed{
+S_{i,d}
 =
-\begin{cases}
-p_{i,t,j},
-& \text{block 报价},\\
-\displaystyle
-p_{i,t,j}
+\sum_{t=2}^{N}
+\mathbf{1}
+(
+k_t\ne k_{t-1}
+)
+}
+$$
+
+字段：
+
+```text
+daily_curve_switch_count
+```
+
+---
+
+## 5.4 `daily_curve_switch_rate`：日内策略切换率
+
+$$
+\boxed{
+R^{switch}_{i,d}
+=
+\frac{
+S_{i,d}
+}{
+N-1
+}
+}
+$$
+
+仅当：
+
+$$
+N\ge2
+$$
+
+时定义。
+
+字段：
+
+```text
+daily_curve_switch_rate
+```
+
+---
+
+## 5.5 `daily_intraday_price_range`：日内价格跨度
+
+对当天所有不同 `curve_key`，分别取：
+
+- 最大报价价格 $p^{max}$；
+- 最小报价价格 $p^{min}$；
+- 整体报价水平 $L$。
+
+定义：
+
+$$
+R^{max}_{i,d}
+=
+\max_c p^{max}_c
+-
+\min_c p^{max}_c
+$$
+
+$$
+R^{min}_{i,d}
+=
+\max_c p^{min}_c
+-
+\min_c p^{min}_c
+$$
+
+$$
+R^{level}_{i,d}
+=
+\max_c L_c
+-
+\min_c L_c
+$$
+
+最终：
+
+$$
+\boxed{
+R^{price}_{i,d}
+=
+\frac{
+R^{max}_{i,d}
 +
-\frac{x-x_{i,t,j}}
-{x_{i,t,j+1}-x_{i,t,j}}
-\left(p_{i,t,j+1}-p_{i,t,j}\right),
-& \text{sloped 报价}.
-\end{cases}
-$$
-
-在 $x=1$ 时取最后一个报价点 $p_{i,t,m}$。
-
-所有维度都遵循下面的追溯链：
-
-```text
-原始 (MW, price) 报价断点
-        -> 时段原子特征
-        -> 主体 × 日期的日级统计
-        -> 主体跨日长期统计
-        -> 原值 + 百分位 + 独立状态
-```
-
-日级层先压缩同一天的多个时段，长期层再跨日取统计量。因此长期画像让每个有效日期获得近似相同权重，不会因为某一天记录时段更多而自动获得更大权重。
-
-下面逐维给出当前代码的完整公式。
-
-### 3.3 维度 1：报价水平 `lt_bid_level`
-
-#### 时段层
-
-单时段整体报价水平记为 $L_{i,t}$。它是归一化容量轴上的报价面积：
-
-$$
-L_{i,t}=\int_0^1P_{i,t}(x)\,dx
-$$
-
-当前代码的离散计算为：
-
-$$
-L_{i,t}
-=
-\begin{cases}
-\displaystyle
-\sum_{j=1}^{m-1}
-\frac{p_{i,t,j}+p_{i,t,j+1}}{2}\Delta x_{i,t,j},
-& \text{sloped 报价},\\
-\displaystyle
-\sum_{j=1}^{m-1}
-p_{i,t,j}\Delta x_{i,t,j},
-& \text{block 报价}.
-\end{cases}
-$$
-
-单点报价或数量跨度为 0 时，直接取该点价格。
-
-#### 日级与长期层
-
-日典型报价水平：
-
-$$
-\ell_{i,d}
-=
-\operatorname{Median}_{t\in\mathcal T_{i,d}}L_{i,t}
-$$
-
-长期报价水平：
-
-$$
-\boxed{
-L_i^{LT}
-=
-\operatorname{Median}_{d\in\mathcal D_i}\ell_{i,d}
+R^{min}_{i,d}
++
+R^{level}_{i,d}
+}{
+3
+}
 }
 $$
 
-字段链：
+字段：
 
 ```text
-bid_level -> daily_bid_level -> lt_bid_level -> 报价水平
+daily_intraday_price_range
 ```
 
-`lt_bid_level` 保留价格量纲。高值表示主体长期容量加权报价水平相对更高；低值表示相对更低。它描述报价本身，不是相对市场出清价的价差。
-
-### 3.4 维度 2：调整幅度 `lt_adjustment_magnitude`
-
-#### 同时槽自身历史基线
-
-当前记录的调整不是相对上一时段，也不是相对市场均价，而是相对该主体“相同本地时槽”的自身历史。设 $\mathcal H_{i,t}^{slot}$ 为当前记录之前、同主体同本地时槽最多 30 条有效 $L$，则：
+若当天只有一种曲线：
 
 $$
-B_{i,t}
-=
-\operatorname{Median}
-\left(\mathcal H_{i,t}^{slot}\right)
+R^{price}_{i,d}=0
 $$
 
-只有历史至少 5 条时才计算基线。时段有符号调整偏差为：
+---
 
-$$
-R_{i,t}=L_{i,t}-B_{i,t}
-$$
+# 6. 01：历史 `participant × slot` 原子
 
-其中 $R_{i,t}>0$ 表示相对自身历史上调，$R_{i,t}<0$ 表示下调。
+01 同时建立：
 
-#### 日级与长期层
+```text
+intraday_slot_core_<year>.csv
+```
 
-日典型调整幅度只看改动大小，不保留方向：
+对：
 
-$$
-m_{i,d}
-=
-\operatorname{Median}_{t\in\mathcal T_{i,d}}
-\left|R_{i,t}\right|
-$$
+```text
+participant_id × local_slot_seconds
+```
 
-长期调整幅度：
+累积历史均值。
+
+对任一时段行为量 $f_{i,t}$：
 
 $$
 \boxed{
-A_i^{mag}
+\bar f^{slot}_{i,h}
 =
-\operatorname{Median}_{d\in\mathcal D_i}m_{i,d}
+\frac{
+1
+}{
+N_{i,h}
+}
+\sum_{t\in\mathcal T_{i,h}}
+f_{i,t}
 }
 $$
 
-字段链：
+当前保存：
+
+| 字段 | 定义 |
+|---|---|
+| `slot_bid_level_mean` | $\operatorname{Mean}_{t\in\mathcal T_{i,h}} L_{i,t}$ |
+| `slot_adjustment_magnitude_mean` | $\operatorname{Mean} A^{mag}_{i,t}$ |
+| `slot_quantity_hhi_mean` | $\operatorname{Mean} HHI^Q_{i,t}$ |
+| `slot_effective_segment_count_mean` | $\operatorname{Mean} K^{eff}_{i,t}$ |
+| `slot_flat_curve_flag_mean` | $\operatorname{Mean} F_{i,t}$ |
+| `slot_tail_uplift_ratio_mean` | $\operatorname{Mean} T_{i,t}$ |
+| `slot_curve_bend_ratio_mean` | $\operatorname{Mean} C_{i,t}$ |
+
+同时保存每个字段对应的：
 
 ```text
-adjustment_magnitude
-    -> daily_adjustment_magnitude
-    -> lt_adjustment_magnitude
-    -> 调整幅度
+slot_<feature>_count
 ```
 
-高值表示主体经常明显偏离自己的同时槽历史报价；低值表示长期报价更接近自身历史习惯。该维度不区分上调或下调，调整方向保留在 `daily_adjustment_bias` 和短期状态 `st_adjustment_bias_z` 中。
+以及：
 
-### 3.5 维度 3：持续性 `lt_strategy_persistence`
+```text
+slot_observation_count
+```
 
-先对每个自然日计算有符号调整偏差中位数：
+---
+
+# 7. 02：9 个长期稳定策略特征
+
+长期画像基于完整历史参考周期 $\mathcal D_i$。
+
+## 7.1 正式 LT 特征表
+
+| 序号 | 字段 | 数学定义 | 策略含义 |
+|---:|---|---|---|
+| 1 | `lt_bid_level` | $\operatorname{Median}_{d\in\mathcal D_i}(daily\_bid\_level_{i,d})$ | 长期整体报价水平 |
+| 2 | `lt_adjustment_magnitude` | $\operatorname{Median}_{d}(daily\_adjustment\_magnitude_{i,d})$ | 长期主动偏离自身历史习惯的幅度 |
+| 3 | `lt_strategy_persistence` | 见 7.2 | 历史报价调整方向/幅度在连续日间的持续性 |
+| 4 | `lt_quantity_hhi` | $\operatorname{Median}_{d}(daily\_quantity\_hhi_{i,d})$ | 长期容量区间集中程度 |
+| 5 | `lt_effective_segment_count` | $\operatorname{Median}_{d}(daily\_effective\_segment\_count_{i,d})$ | 长期报价结构复杂度 |
+| 6 | `lt_flat_curve_rate` | $\operatorname{Median}_{d}(daily\_flat\_curve\_rate_{i,d})$ | 长期采用平价/近似平价结构的倾向 |
+| 7 | `lt_tail_uplift_ratio` | $\operatorname{Median}_{d}(daily\_tail\_uplift\_ratio_{i,d})$ | 长期尾部抬价倾向 |
+| 8 | `lt_curve_bend_ratio` | $\operatorname{Median}_{d}(daily\_curve\_bend\_ratio_{i,d})$ | 长期前后段价格变化的不对称程度 |
+| 9 | `lt_shape_variability` | 见 7.3 | 长期报价相对形态的稳定/波动程度 |
+
+---
+
+## 7.2 `lt_strategy_persistence`
+
+令日级调整偏差为：
 
 $$
 a_{i,d}
 =
-\operatorname{Median}_{t\in\mathcal T_{i,d}}R_{i,t}
+daily\_adjustment\_bias_{i,d}
 $$
 
-只保留日期恰好相差 1 天、且前后两日 $a_{i,d}$ 都有效的日对。设这些连续日对组成集合 $\mathcal C_i$，则：
+只保留真实连续日：
+
+$$
+d_j-d_{j-1}=1
+$$
+
+构造：
+
+$$
+\mathbf{a}^{-}
+=
+\left[a_{i,d_1},\ldots,a_{i,d_{n-1}}\right]
+$$
+
+$$
+\mathbf{a}^{+}
+=
+\left[a_{i,d_2},\ldots,a_{i,d_n}\right]
+$$
+
+则：
 
 $$
 \boxed{
-A_i^{persist}
+lt\_strategy\_persistence_i
 =
-\operatorname{Corr}
-\left(
-\{a_{i,d-1}\}_{d\in\mathcal C_i},
-\{a_{i,d}\}_{d\in\mathcal C_i}
-\right)
+\operatorname{Corr}_{\mathrm{Pearson}}
+(
+\mathbf{a}^{-},
+\mathbf{a}^{+}
+)
 }
 $$
 
-这里使用 Pearson 相关系数。至少需要 5 对有效连续日；若前一日序列或后一日序列的标准差不大于 $10^{-12}$，结果也记为缺失。
+至少要求 5 对有效连续日。
 
-字段链：
+---
 
-```text
-adjustment_bias -> daily_adjustment_bias
-                -> lt_strategy_persistence
-                -> 持续性
-```
+## 7.3 `lt_shape_variability`
 
-解释：
-
-- 接近 1：今天相对自身历史上调或下调的模式，次日往往延续；
-- 接近 0：相邻日调整关系较弱；
-- 小于 0：调整更可能在相邻日反向；
-- 缺失：连续日对不足，或长期调整完全固定而无法计算相关系数。
-
-因此“持续性低”既可能表示弱相关，也可能表示负相关；分析时应同时查看原始连续值，而不能只看低/中/高状态。
-
-### 3.6 维度 4：容量集中度 `lt_quantity_hhi`
-
-归一化后，各相邻断点之间的容量份额为 $\Delta x_{i,t,j}$，且总和为 1。单时段容量 HHI 为：
-
-$$
-H_{i,t}
-=
-\sum_{j=1}^{m-1}
-\left(\Delta x_{i,t,j}\right)^2
-$$
-
-日级容量集中度：
-
-$$
-h_{i,d}
-=
-\operatorname{Median}_{t\in\mathcal T_{i,d}}H_{i,t}
-$$
-
-长期容量集中度：
+先建立主体长期 shape 原型：
 
 $$
 \boxed{
-H_i^{LT}
-=
-\operatorname{Median}_{d\in\mathcal D_i}h_{i,d}
-}
-$$
-
-字段链：
-
-```text
-quantity_hhi -> daily_quantity_hhi -> lt_quantity_hhi -> 容量集中度
-```
-
-高值表示大部分容量集中于少数区间；低值表示容量更均匀地分散在多个区间。单点或零跨度曲线在当前代码中取 $H_{i,t}=1$。该指标衡量的是容量区间分配，不直接衡量价格高低。
-
-### 3.7 维度 5：有效段数 `lt_effective_segment_count`
-
-单时段有效段数不是原始断点数量，而是相邻清洗后报价点发生实际价格变化的次数加 1：
-
-$$
-K_{i,t}^{eff}
-=
-1+
-\sum_{j=1}^{m-1}
-\mathbf 1
-\left(
-|p_{i,t,j+1}-p_{i,t,j}|>\varepsilon_p
-\right)
-$$
-
-其中 $\varepsilon_p=10^{-9}$。连续多个同价断点只算一个有效价格段。
-
-日级有效段数：
-
-$$
-k_{i,d}
-=
-\operatorname{Median}_{t\in\mathcal T_{i,d}}K_{i,t}^{eff}
-$$
-
-长期有效段数：
-
-$$
-\boxed{
-K_i^{LT}
-=
-\operatorname{Median}_{d\in\mathcal D_i}k_{i,d}
-}
-$$
-
-字段链：
-
-```text
-effective_segment_count
-    -> daily_effective_segment_count
-    -> lt_effective_segment_count
-    -> 有效段数
-```
-
-高值表示报价曲线使用更多真正不同的价格段，结构更细；低值表示报价结构更简单。它与容量集中度含义不同：段数多不代表容量一定均匀，段数少也不代表容量一定集中。
-
-### 3.8 维度 6：平价偏好 `lt_flat_curve_rate`
-
-当前代码用报价曲线首尾价格是否相同判断单时段平价状态：
-
-$$
-F_{i,t}
-=
-\mathbf 1
-\left(
-|P_{i,t}(1)-P_{i,t}(0)|\le\varepsilon_p
-\right)
-$$
-
-日平价曲线比例为日内平价标志的均值：
-
-$$
-f_{i,d}
-=
-\frac{1}{|\mathcal T_{i,d}|}
-\sum_{t\in\mathcal T_{i,d}}F_{i,t}
-$$
-
-长期平价偏好为各日平价比例的中位数：
-
-$$
-\boxed{
-F_i^{LT}
-=
-\operatorname{Median}_{d\in\mathcal D_i}f_{i,d}
-}
-$$
-
-字段链：
-
-```text
-flat_curve_flag -> daily_flat_curve_rate -> lt_flat_curve_rate -> 平价偏好
-```
-
-高值表示主体在多数日期更偏好首尾同价曲线；低值表示更常使用首尾有价差的曲线。由于先计算每日比例、再跨日取中位数，`lt_flat_curve_rate` 是“典型日期的平价比例”，不是把全年所有时段直接合并后的单一比例。
-
-### 3.9 维度 7：尾部抬价 `lt_tail_uplift_ratio`
-
-对非平价曲线，在归一化容量位置 $x=0.8$ 和 $x=1$ 读取价格。单时段尾部抬价比例为：
-
-$$
-T_{i,t}
-=
-\frac{P_{i,t}(1)-P_{i,t}(0.8)}
-{|P_{i,t}(1)-P_{i,t}(0)|+\varepsilon}
-$$
-
-平价曲线在当前代码中直接令 $T_{i,t}=0$。
-
-日级与长期统计为：
-
-$$
-\tau_{i,d}
-=
-\operatorname{Median}_{t\in\mathcal T_{i,d}}T_{i,t}
-$$
-
-$$
-\boxed{
-T_i^{LT}
-=
-\operatorname{Median}_{d\in\mathcal D_i}\tau_{i,d}
-}
-$$
-
-字段链：
-
-```text
-tail_uplift_ratio
-    -> daily_tail_uplift_ratio
-    -> lt_tail_uplift_ratio
-    -> 尾部抬价
-```
-
-正值越大，说明从 80% 容量到满容量的涨价在首尾总价差中越突出；接近 0 表示尾部几乎不额外抬价；负值表示尾部价格下降。该比值不是概率，也不被代码强制限制在 $[0,1]$。
-
-### 3.10 维度 8：曲线弯折 `lt_curve_bend_ratio`
-
-头部 20% 容量的价格变化为：
-
-$$
-\Delta P_{i,t}^{head}
-=
-P_{i,t}(0.2)-P_{i,t}(0)
-$$
-
-尾部 20% 容量的价格变化为：
-
-$$
-\Delta P_{i,t}^{tail}
-=
-P_{i,t}(1)-P_{i,t}(0.8)
-$$
-
-单时段曲线弯折比为：
-
-$$
-C_{i,t}
-=
-\frac{
-\Delta P_{i,t}^{tail}-\Delta P_{i,t}^{head}
-}
-{|P_{i,t}(1)-P_{i,t}(0)|+\varepsilon}
-$$
-
-平价曲线在当前代码中直接令 $C_{i,t}=0$。日级与长期统计为：
-
-$$
-c_{i,d}
-=
-\operatorname{Median}_{t\in\mathcal T_{i,d}}C_{i,t}
-$$
-
-$$
-\boxed{
-C_i^{LT}
-=
-\operatorname{Median}_{d\in\mathcal D_i}c_{i,d}
-}
-$$
-
-字段链：
-
-```text
-curve_bend_ratio
-    -> daily_curve_bend_ratio
-    -> lt_curve_bend_ratio
-    -> 曲线弯折
-```
-
-正值表示尾部涨幅强于头部，负值表示头部涨幅更强，接近 0 表示首尾两段变化较接近。它是首尾局部涨幅差的结构指标，不是严格意义上的二阶导数或几何曲率。
-
-### 3.11 维度 9：形态波动 `lt_shape_variability`
-
-该维度先去掉绝对价格水平和首尾总价差，只比较曲线的相对形状。
-
-对非平价曲线，在固定网格：
-
-$$
-\mathcal U
-=
-\{0,0.05,0.10,\ldots,0.95,1\}
-$$
-
-上计算 21 点归一化形态：
-
-$$
-V_{i,t}(u)
-=
-\frac{P_{i,t}(u)-P_{i,t}(0)}
-{P_{i,t}(1)-P_{i,t}(0)},
-\qquad u\in\mathcal U
-$$
-
-因此有效形态总是满足 $V_{i,t}(0)=0$、$V_{i,t}(1)=1$。平价曲线由于分母为 0，当前代码不定义 21 点形态。
-
-每日典型形态对日内有效时段逐点取中位数：
-
-$$
-V_{i,d}(u)
-=
-\operatorname{Median}_{t\in\mathcal T_{i,d}}V_{i,t}(u)
-$$
-
-02 只把 21 个坐标全部有效的日期纳入形态计算。主体长期形态原型为：
-
-$$
 V_i^{LT}(u)
 =
-\operatorname{Median}_{d\in\mathcal D_i^{shape}}V_{i,d}(u)
+Median_{d\in\mathcal D_i}
+V_{i,d}(u)
+}
 $$
 
-日期 $d$ 相对长期原型的形态距离为：
+对每个 shape 完整的历史日：
 
 $$
-D_{i,d}^{shape}
+D^{shape}_{i,d}
 =
 \sqrt{
 \frac{1}{21}
-\sum_{u\in\mathcal U}
+\sum_{u\in\mathcal G}
 \left[
-V_{i,d}(u)-V_i^{LT}(u)
+V_{i,d}(u)
+-
+V_i^{LT}(u)
 \right]^2
 }
 $$
 
-最终形态波动为这些日级距离的中位数：
+最终：
 
 $$
 \boxed{
-D_i^{shape}
+lt\_shape\_variability_i
 =
-\operatorname{Median}_{d\in\mathcal D_i^{shape}}
-D_{i,d}^{shape}
+Median_d
+D^{shape}_{i,d}
 }
 $$
 
-字段链：
+同时输出长期 shape 原型：
 
 ```text
-shape_v00 ... shape_v20
-    -> daily_shape_v00 ... daily_shape_v20
-    -> lt_shape_variability
-    -> 形态波动
+lt_shape_v00
+...
+lt_shape_v20
 ```
 
-高值表示即使去掉绝对价格水平，主体的曲线相对形状在不同日期之间仍经常变化；低值表示相对形态稳定。它不等于报价水平波动，也不等于尾部抬价本身。
-
-代码同时保存：
-
-```text
-shape_defined_days
-lt_shape_v00 ... lt_shape_v20
-```
-
-前者是形态完整日期数，后者是长期 21 点形态原型；它们是辅助字段，不属于正式 9 个长期维度。
-
-### 3.12 长期部分 $Z_i^{LT}$ 的完整定义表
-
-| 序号 | 中文维度 | 正式字段 | 数学定义 | 高低值解释 |
-|---:|---|---|---|---|
-| 1 | 报价水平 | `lt_bid_level` | $L_i^{LT}=\operatorname{Med}_{d\in\mathcal D_i}\operatorname{Med}_{t\in\mathcal T_{i,d}}\int_0^1P_{i,t}(x)\,dx$ | 低：长期容量加权报价较低；高：长期报价较高 |
-| 2 | 调整幅度 | `lt_adjustment_magnitude` | $A_i^{mag}=\operatorname{Med}_{d\in\mathcal D_i}\operatorname{Med}_{t\in\mathcal T_{i,d}}\left\lvert L_{i,t}-\operatorname{Med}_{h\in\mathcal H_{i,t}^{slot}}L_{i,h}\right\rvert$ | 低：接近自身同时槽历史；高：经常明显偏离自身历史 |
-| 3 | 持续性 | `lt_strategy_persistence` | $A_i^{persist}=\operatorname{Corr}_{d\in\mathcal C_i}\left(a_{i,d-1},a_{i,d}\right)$，其中 $a_{i,d}=\operatorname{Med}_{t\in\mathcal T_{i,d}}R_{i,t}$ | 低或负：弱延续或反向；高：相邻自然日调整模式更连续 |
-| 4 | 容量集中度 | `lt_quantity_hhi` | $H_i^{LT}=\operatorname{Med}_{d}\operatorname{Med}_{t}\sum_j\left(\frac{q_{i,t,j+1}-q_{i,t,j}}{q_{i,t,m}-q_{i,t,1}}\right)^2$ | 低：容量分散；高：容量集中于少数区间 |
-| 5 | 有效段数 | `lt_effective_segment_count` | $K_i^{LT}=\operatorname{Med}_{d}\operatorname{Med}_{t}\left[1+\sum_j\mathbf 1\left(\left\lvert p_{i,t,j+1}-p_{i,t,j}\right\rvert>\varepsilon_p\right)\right]$ | 低：价格结构简单；高：真正不同的价格段更多 |
-| 6 | 平价偏好 | `lt_flat_curve_rate` | $F_i^{LT}=\operatorname{Med}_{d}\left[\frac{1}{\lvert\mathcal T_{i,d}\rvert}\sum_{t\in\mathcal T_{i,d}}\mathbf 1\left(\left\lvert P_{i,t}(1)-P_{i,t}(0)\right\rvert\le\varepsilon_p\right)\right]$ | 低：较少采用首尾同价曲线；高：更偏好平价曲线 |
-| 7 | 尾部抬价 | `lt_tail_uplift_ratio` | $T_i^{LT}=\operatorname{Med}_{d}\operatorname{Med}_{t}\left\{\mathbf 1\left(\left\lvert P_{i,t}(1)-P_{i,t}(0)\right\rvert>\varepsilon_p\right)\frac{P_{i,t}(1)-P_{i,t}(0.8)}{\left\lvert P_{i,t}(1)-P_{i,t}(0)\right\rvert+\varepsilon}\right\}$ | 低或负：尾部抬价弱或下降；高：最后 20% 容量抬价突出；平价曲线取 0 |
-| 8 | 曲线弯折 | `lt_curve_bend_ratio` | $C_i^{LT}=\operatorname{Med}_{d}\operatorname{Med}_{t}\left\{\mathbf 1\left(\left\lvert P_{i,t}(1)-P_{i,t}(0)\right\rvert>\varepsilon_p\right)\frac{[P_{i,t}(1)-P_{i,t}(0.8)]-[P_{i,t}(0.2)-P_{i,t}(0)]}{\left\lvert P_{i,t}(1)-P_{i,t}(0)\right\rvert+\varepsilon}\right\}$ | 负：头部涨幅相对更强；正且高：尾部涨幅相对更强；平价曲线取 0 |
-| 9 | 形态波动 | `lt_shape_variability` | $D_i^{shape}=\operatorname{Med}_{d\in\mathcal D_i^{shape}}\sqrt{\frac{1}{21}\sum_{u\in\mathcal U}[V_{i,d}(u)-V_i^{LT}(u)]^2}$ | 低：跨日相对形态稳定；高：跨日形态变化大 |
-
-因此：
-
-$$
-Z_i^{LT}
-=
-\left[
-L_i^{LT},
-A_i^{mag},
-A_i^{persist},
-H_i^{LT},
-K_i^{LT},
-F_i^{LT},
-T_i^{LT},
-C_i^{LT},
-D_i^{shape}
-\right]
-\in\mathbb R^9
-$$
-
-这 9 个特征是主体级慢变量，描述“这个主体平时怎么报”。
-
-### 3.13 长期画像完整度
-
-`active_days` 是主体有效日期数。`lt_nonmissing_count` 是 9 个长期维度中的非缺失数量：
-
-$$
-N_i^{LT,obs}
-=
-\sum_{j=1}^{9}
-\mathbf 1
-\left(Z_{i,j}^{LT}\text{ 非缺失}\right)
-$$
-
-当：
-
-$$
-N_i^{LT,obs}\ge 7
-$$
-
-时设置：
-
-```text
-lt_ready_flag = 1
-```
-
-否则 `lt_ready_flag = 0`。这不表示主体“没有画像”，只表示 9 个维度中缺失较多。长期平价主体可能缺少 21 点形态，长期调整完全固定的主体也可能无法定义持续性。
-
-`lt_ready_flag` 用于确定辅助 KMeans 的发现队列，不决定一个主体是否能保留已有的单维原值、百分位或独立状态。
+这些 21 个坐标是辅助历史形态基准，不计入默认 9 LT 模型维数。
 
 ---
 
-## 4. 03：构建 9 个短期状态与 8 个 Strategy Break
+# 8. 03：历史短期策略状态原子
 
-脚本：
+新技术路线中，03 的日级 ST **不是未来预测期在线输入**，而是用于从完整历史年度中提炼“主体历史上如何发生短周期策略变化”。
 
-<code>scripts/03_build_short_term_strategy_state_fast.py</code>
+对于历史日期 $d$：
 
-默认输入与输出：
+$$
+\mathcal H^S(d)
+=
+[d-7,d-1]
+$$
 
-| 类型 | 路径 |
-|---|---|
-| 输入日级策略数据 | <code>data/processed/final_clean/daily/2025/daily_strategy_core_2025.csv</code> |
-| 输出短期状态与 Break | <code>data/processed/final_clean/short_term/2025/short_term_strategy_state_2025.csv</code> |
+$$
+\mathcal H^L(d)
+=
+[d-67,d-8]
+$$
 
-短期部分是主体—日期级动态状态：
+两窗口不重叠。
+
+对日级行为量 $f$：
+
+$$
+f^{recent}_{i,d}
+=
+Median_{\tau\in\mathcal H^S(d)}
+f_{i,\tau}
+$$
+
+$$
+f^{base}_{i,d}
+=
+Median_{\tau\in\mathcal H^L(d)}
+f_{i,\tau}
+$$
+
+$$
+s^f_{i,d}
+=
+1.4826\,
+\operatorname{MAD}_{\tau\in\mathcal H^L(d)}
+(f_{i,\tau})
+$$
+
+若：
+
+$$
+s^f_{i,d}
+>
+s_f^{floor}
+$$
+
+则：
 
 $$
 \boxed{
-Z_{i,d}^{ST}
+z^f_{i,d}
 =
-\left[
-z_L,\,
-z_{A^{bias}},\,
-z_{A^{mag}},\,
-z_{HHI},\,
-z_{K^{eff}},\,
-z_{F^{flat}},\,
-z_{T^{rel}},\,
-z_{B^{rel}},\,
-D_{shape}^{ST}
-\right]
+\operatorname{clip}
+\left(
+\frac{
+f^{recent}_{i,d}
+-
+f^{base}_{i,d}
+}{
+s^f_{i,d}
+},
+-10,
+10
+\right)
 }
 $$
 
-它回答的是：
-
-> “截至日期 $d$，这个主体最近相对自己的历史习惯发生了什么变化？”
-
-### 4.1 近期窗口、长期基线与稳健标准化
-
-对主体 $i$ 的目标日期 $d$：
+最低数据要求：
 
 $$
-\mathcal R_{i,d}
-=
-\{d-7,\ldots,d-1\}
+N_{recent}\ge3,
+\qquad
+N_{long}\ge20
 $$
 
-是近期 7 个日历日窗口，标量特征至少需要 3 个有效值；
+---
+
+## 8.1 Historical Break
+
+若：
 
 $$
-\mathcal L_{i,d}
-=
-\{d-67,\ldots,d-8\}
+s^f_{i,d}
+\le
+s_f^{floor}
 $$
 
-是更早 60 个日历日基线窗口，标量特征至少需要 20 个有效值。
-
-对任一日级标量序列 $x_{i,s}$，定义：
+且：
 
 $$
-x_{i,d}^{recent}
-=
-\operatorname{Med}_{s\in\mathcal R_{i,d}}x_{i,s}
+\left|
+f^{recent}_{i,d}
+-
+f^{base}_{i,d}
+\right|
+>
+s_f^{floor}
 $$
 
-$$
-x_{i,d}^{long}
-=
-\operatorname{Med}_{s\in\mathcal L_{i,d}}x_{i,s}
-$$
-
-$$
-MAD_{i,d}^{long}(x)
-=
-\operatorname{Med}_{s\in\mathcal L_{i,d}}
-\left\lvert
-x_{i,s}-x_{i,d}^{long}
-\right\rvert
-$$
-
-长期稳健尺度为：
-
-$$
-S_{i,d}^{long}(x)
-=
-1.4826\,MAD_{i,d}^{long}(x)
-$$
-
-当该尺度大于数值容差时：
+则：
 
 $$
 \boxed{
-z_{i,d}(x)
+B^f_{i,d}=1
+}
+$$
+
+否则：
+
+$$
+B^f_{i,d}=0
+$$
+
+当前 practical-zero floor：
+
+| 特征 | $s_f^{floor}$ |
+|---|---:|
+| `bid_level` | $10^{-3}$ |
+| `adjustment_bias` | $10^{-3}$ |
+| `adjustment_magnitude` | $10^{-3}$ |
+| `quantity_hhi` | $10^{-6}$ |
+| `effective_segment_count` | $10^{-6}$ |
+| `flat_curve_rate` | $10^{-6}$ |
+| `tail_uplift_ratio` | $10^{-6}$ |
+| `curve_bend_ratio` | $10^{-6}$ |
+
+---
+
+## 8.2 Historical shape shift
+
+近期 shape 原型：
+
+$$
+V^{recent}_{i,d}
+=
+Median_{\tau\in[d-7,d-1]}
+V_{i,\tau}
+$$
+
+更早历史 shape 原型：
+
+$$
+V^{base}_{i,d}
+=
+\operatorname{Median}_{\tau\in[d-67,d-8]}
+V_{i,\tau}
+$$
+
+则：
+
+$$
+\boxed{
+S^{shape}_{i,d}
+=
+\operatorname{RMSE}
+\left(
+V^{recent}_{i,d},
+V^{base}_{i,d}
+\right)
+}
+$$
+
+最低要求：
+
+$$
+N_{recent}^{shape}\ge2,
+\qquad
+N_{long}^{shape}\ge10
+$$
+
+---
+
+# 9. 03：8 个主体级历史短期策略倾向
+
+日级 historical ST 只用于构造主体级汇总。
+
+| 序号 | 字段 | 数学定义 | 含义 |
+|---:|---|---|---|
+| 1 | `short_bid_level_abs_z_median` | $\operatorname{Median}_d(|z^{bid}_{i,d}|)$ | 主体典型短期报价水平偏移强度 |
+| 2 | `short_bid_level_abs_z_p90` | $Q_{0.90,d}(|z^{bid}_{i,d}|)$ | 主体历史较强报价偏移的上分位程度 |
+| 3 | `short_bid_level_high_state_rate` | $\frac{1}{N}\sum_d\mathbf{1}(z^{bid}_{i,d}>1)$ | 历史上进入明显偏高报价状态的频率 |
+| 4 | `short_adjustment_magnitude_abs_z_median` | $\operatorname{Median}_d(|z^{adjmag}_{i,d}|)$ | 历史调整幅度的典型短周期偏离 |
+| 5 | `short_structure_abs_z_median` | 见下式 | 历史报价结构整体短周期变化强度 |
+| 6 | `short_shape_shift_median` | $\operatorname{Median}_d(S^{shape}_{i,d})$ | 历史报价相对形态迁移的典型程度 |
+| 7 | `short_break_rate` | $\frac{1}{N_d}\sum_d\mathbf{1}(\sum_fB^f_{i,d}>0)$ | 历史稳定策略被打破的频率 |
+| 8 | `short_ready_day_share` | $\frac{1}{N_d}\sum_d Ready_{i,d}$ | 历史短期状态可可靠构建的日期比例 |
+
+其中结构类集合：
+
+$$
+\mathcal F_{struct}
+=
+\{
+quantity\_hhi,
+segment\_count,
+flat,
+tail,
+bend
+\}
+$$
+
+先计算每天：
+
+$$
+A^{struct}_{i,d}
 =
 \frac{
-x_{i,d}^{recent}-x_{i,d}^{long}
+1
 }{
-1.4826\,MAD_{i,d}^{long}(x)
+|\mathcal F_{valid}|
 }
+\sum_{f\in\mathcal F_{valid}}
+|z^f_{i,d}|
+$$
+
+再：
+
+$$
+\boxed{
+short\_structure\_abs\_z\_median_i
+=
+Median_d
+A^{struct}_{i,d}
 }
 $$
 
-因此正值表示近期高于自身历史习惯，负值表示近期低于自身历史习惯，绝对值越大表示变化相对长期波动越显著。
+历史日 readiness 定义为：8 个标量 ST 中至少 6 个已被连续 z 或 Break 明确表示。
 
-### 4.2 短期部分 $Z_{i,d}^{ST}$ 的完整定义表
+---
 
-下表中的 $\ell_{i,s}$、$a_{i,s}$、$m_{i,s}$、$h_{i,s}$、$k_{i,s}$、$f_{i,s}$、$\tau_{i,s}$、$c_{i,s}$ 分别是第 3 节已经从原始报价曲线定义的日级报价水平、调整方向、调整幅度、容量 HHI、有效段数、平价比例、尾部抬价和曲线弯折。
+# 10. 04：月份条件策略画像
 
-| 序号 | 短期状态 | 正式字段 | 完整数学定义 | 解释 |
-|---:|---|---|---|---|
-| 1 | 报价水平偏移 $z_L$ | <code>st_bid_level_z</code> | $\displaystyle z_L=\frac{\operatorname{Med}_{s\in\mathcal R_{i,d}}\ell_{i,s}-\operatorname{Med}_{s\in\mathcal L_{i,d}}\ell_{i,s}}{1.4826\,\operatorname{Med}_{s\in\mathcal L_{i,d}}\left\lvert\ell_{i,s}-\operatorname{Med}_{r\in\mathcal L_{i,d}}\ell_{i,r}\right\rvert}$ | 最近报价水平相对历史基准的稳健标准化偏移 |
-| 2 | 调整方向偏移 $z_{A^{bias}}$ | <code>st_adjustment_bias_z</code> | $\displaystyle z_{A^{bias}}=\frac{\operatorname{Med}_{s\in\mathcal R_{i,d}}a_{i,s}-\operatorname{Med}_{s\in\mathcal L_{i,d}}a_{i,s}}{1.4826\,\operatorname{Med}_{s\in\mathcal L_{i,d}}\left\lvert a_{i,s}-\operatorname{Med}_{r\in\mathcal L_{i,d}}a_{i,r}\right\rvert}$ | 最近更倾向相对自身历史上调还是下调 |
-| 3 | 调整幅度偏移 $z_{A^{mag}}$ | <code>st_adjustment_magnitude_z</code> | $\displaystyle z_{A^{mag}}=\frac{\operatorname{Med}_{s\in\mathcal R_{i,d}}m_{i,s}-\operatorname{Med}_{s\in\mathcal L_{i,d}}m_{i,s}}{1.4826\,\operatorname{Med}_{s\in\mathcal L_{i,d}}\left\lvert m_{i,s}-\operatorname{Med}_{r\in\mathcal L_{i,d}}m_{i,r}\right\rvert}$ | 最近调整大小相对长期习惯是否扩大 |
-| 4 | 容量集中度偏移 $z_{HHI}$ | <code>st_quantity_hhi_z</code> | $\displaystyle z_{HHI}=\frac{\operatorname{Med}_{s\in\mathcal R_{i,d}}h_{i,s}-\operatorname{Med}_{s\in\mathcal L_{i,d}}h_{i,s}}{1.4826\,\operatorname{Med}_{s\in\mathcal L_{i,d}}\left\lvert h_{i,s}-\operatorname{Med}_{r\in\mathcal L_{i,d}}h_{i,r}\right\rvert}$ | 最近容量配置是否变得更集中或更分散 |
-| 5 | 有效段数偏移 $z_{K^{eff}}$ | <code>st_effective_segment_count_z</code> | $\displaystyle z_{K^{eff}}=\frac{\operatorname{Med}_{s\in\mathcal R_{i,d}}k_{i,s}-\operatorname{Med}_{s\in\mathcal L_{i,d}}k_{i,s}}{1.4826\,\operatorname{Med}_{s\in\mathcal L_{i,d}}\left\lvert k_{i,s}-\operatorname{Med}_{r\in\mathcal L_{i,d}}k_{i,r}\right\rvert}$ | 最近报价段数是否相对长期结构增加 |
-| 6 | 平价偏好偏移 $z_{F^{flat}}$ | <code>st_flat_curve_rate_z</code> | $\displaystyle z_{F^{flat}}=\frac{\operatorname{Med}_{s\in\mathcal R_{i,d}}f_{i,s}-\operatorname{Med}_{s\in\mathcal L_{i,d}}f_{i,s}}{1.4826\,\operatorname{Med}_{s\in\mathcal L_{i,d}}\left\lvert f_{i,s}-\operatorname{Med}_{r\in\mathcal L_{i,d}}f_{i,r}\right\rvert}$ | 最近是否更偏好首尾同价曲线 |
-| 7 | 尾部抬价偏移 $z_{T^{rel}}$ | <code>st_tail_uplift_ratio_z</code> | $\displaystyle z_{T^{rel}}=\frac{\operatorname{Med}_{s\in\mathcal R_{i,d}}\tau_{i,s}-\operatorname{Med}_{s\in\mathcal L_{i,d}}\tau_{i,s}}{1.4826\,\operatorname{Med}_{s\in\mathcal L_{i,d}}\left\lvert\tau_{i,s}-\operatorname{Med}_{r\in\mathcal L_{i,d}}\tau_{i,r}\right\rvert}$ | 最近尾部抬价相对历史是否增强 |
-| 8 | 曲线弯折偏移 $z_{B^{rel}}$ | <code>st_curve_bend_ratio_z</code> | $\displaystyle z_{B^{rel}}=\frac{\operatorname{Med}_{s\in\mathcal R_{i,d}}c_{i,s}-\operatorname{Med}_{s\in\mathcal L_{i,d}}c_{i,s}}{1.4826\,\operatorname{Med}_{s\in\mathcal L_{i,d}}\left\lvert c_{i,s}-\operatorname{Med}_{r\in\mathcal L_{i,d}}c_{i,r}\right\rvert}$ | 最近曲线前后段涨幅结构是否改变 |
-| 9 | 形态迁移 $D_{shape}^{ST}$ | <code>st_shape_shift</code> | $\displaystyle D_{shape}^{ST}=\sqrt{\frac{1}{21}\sum_{u\in\mathcal U}\left[\operatorname{Med}_{s\in\mathcal R_{i,d}}V_{i,s}(u)-\operatorname{Med}_{s\in\mathcal L_{i,d}}V_{i,s}(u)\right]^2}$ | 近期 21 点曲线形态原型相对更早长期窗口原型的 RMSE |
+对每个：
 
-前 8 个是有正负方向的稳健 z 状态。第 9 个不是 z-score，而是非负的形态迁移距离；越大表示近期曲线相对形态改变越明显。形态计算要求近期至少 2 个完整形态日、长期窗口至少 10 个完整形态日。
+```text
+participant_id × month
+```
 
-### 4.3 Strategy Break 的统一规则
+构造历史月份典型值。
 
-Strategy Break 只针对前 8 个标量状态。若长期窗口尺度为 0：
+最低要求：
 
 $$
-1.4826\,MAD_{i,d}^{long}(x)\le10^{-12}
+N_{i,m}^{active}\ge10
 $$
 
-且近期中位数与长期中位数不同：
+对任一日级行为量 $f$：
 
 $$
-\left\lvert
-x_{i,d}^{recent}-x_{i,d}^{long}
-\right\rvert
->10^{-12}
+\boxed{
+f^{month}_{i,m}
+=
+Median_{d\in\mathcal D_{i,m}}
+f_{i,d}
+}
 $$
 
-则普通 z-score 无法合理表示“从长期完全固定到近期突然改变”，因此定义：
+并以主体长期 LT 为基准：
 
 $$
-break_{i,d}(x)=1
+\boxed{
+\Delta f^{season}_{i,m}
+=
+f^{month}_{i,m}
+-
+f_i^{LT}
+}
 $$
 
-此时相应的 <code>st_*_z</code> 保持缺失，由 Break 标志承载突变信息。若长期尺度为 0 且近期也没有变化，则令对应 z 值为 0，Break 为 0。
+---
 
-### 4.4 Break 部分 $E_{i,d}^{break}$ 的完整定义表
+## 10.1 月份条件表全部字段
 
-| 序号 | Break 事件 | 正式字段 | 触发条件 |
-|---:|---|---|---|
-| 1 | 报价水平 Break | <code>break_bid_level</code> | $MAD^{long}(\ell)=0$ 且 $\operatorname{Med}_{recent}(\ell)\ne\operatorname{Med}_{long}(\ell)$ |
-| 2 | 调整方向 Break | <code>break_adjustment_bias</code> | $MAD^{long}(a)=0$ 且 $\operatorname{Med}_{recent}(a)\ne\operatorname{Med}_{long}(a)$ |
-| 3 | 调整幅度 Break | <code>break_adjustment_magnitude</code> | $MAD^{long}(m)=0$ 且 $\operatorname{Med}_{recent}(m)\ne\operatorname{Med}_{long}(m)$ |
-| 4 | 容量集中度 Break | <code>break_quantity_hhi</code> | $MAD^{long}(h)=0$ 且 $\operatorname{Med}_{recent}(h)\ne\operatorname{Med}_{long}(h)$ |
-| 5 | 有效段数 Break | <code>break_effective_segment_count</code> | $MAD^{long}(k)=0$ 且 $\operatorname{Med}_{recent}(k)\ne\operatorname{Med}_{long}(k)$ |
-| 6 | 平价偏好 Break | <code>break_flat_curve_rate</code> | $MAD^{long}(f)=0$ 且 $\operatorname{Med}_{recent}(f)\ne\operatorname{Med}_{long}(f)$ |
-| 7 | 尾部抬价 Break | <code>break_tail_uplift_ratio</code> | $MAD^{long}(\tau)=0$ 且 $\operatorname{Med}_{recent}(\tau)\ne\operatorname{Med}_{long}(\tau)$ |
-| 8 | 曲线弯折 Break | <code>break_curve_bend_ratio</code> | $MAD^{long}(c)=0$ 且 $\operatorname{Med}_{recent}(c)\ne\operatorname{Med}_{long}(c)$ |
+| 字段 | 数学定义 |
+|---|---|
+| `month_bid_level` | $Median_{d\in\mathcal D_{i,m}} daily\_bid\_level_{i,d}$ |
+| `season_bid_level_delta` | $month\_bid\_level-lt\_bid\_level$ |
+| `month_adjustment_magnitude` | $Median_d daily\_adjustment\_magnitude$ |
+| `season_adjustment_magnitude_delta` | $month\_adjustment\_magnitude-lt\_adjustment\_magnitude$ |
+| `month_quantity_hhi` | $Median_d daily\_quantity\_hhi$ |
+| `season_quantity_hhi_delta` | $month\_quantity\_hhi-lt\_quantity\_hhi$ |
+| `month_effective_segment_count` | $Median_d daily\_effective\_segment\_count$ |
+| `season_effective_segment_count_delta` | $month\_effective\_segment\_count-lt\_effective\_segment\_count$ |
+| `month_flat_curve_rate` | $Median_d daily\_flat\_curve\_rate$ |
+| `season_flat_curve_rate_delta` | $month\_flat\_curve\_rate-lt\_flat\_curve\_rate$ |
+| `month_tail_uplift_ratio` | $Median_d daily\_tail\_uplift\_ratio$ |
+| `season_tail_uplift_ratio_delta` | $month\_tail\_uplift\_ratio-lt\_tail\_uplift\_ratio$ |
+| `month_curve_bend_ratio` | $Median_d daily\_curve\_bend\_ratio$ |
+| `season_curve_bend_ratio_delta` | $month\_curve\_bend\_ratio-lt\_curve\_bend\_ratio$ |
+| `season_shape_shift` | $\operatorname{RMSE}(V^{month}_{i,m},V_i^{LT})$ |
 
-表中的 `MAD = 0` 和“中位数不相等”是语义简写。代码实际使用的数值条件分别是 $1.4826\,MAD\le10^{-12}$ 和 $\left\lvert Median_{recent}-Median_{long}\right\rvert>10^{-12}$。
+月份 shape 原型：
+
+$$
+V^{month}_{i,m}(u)
+=
+Median_{d\in\mathcal D_{i,m}}
+V_{i,d}(u)
+$$
 
 因此：
 
 $$
-E_{i,d}^{break}
-=
-\left[
-e_L,\,
-e_{A^{bias}},\,
-e_{A^{mag}},\,
-e_{HHI},\,
-e_{K^{eff}},\,
-e_{F^{flat}},\,
-e_{T^{rel}},\,
-e_{B^{rel}}
-\right]
-\in\{0,1\}^8
-$$
-
-代码还提供三个派生汇总字段：
-
-| 字段 | 定义 | 是否额外计入 26 维 |
-|---|---|---|
-| <code>strategy_break_count</code> | 8 个 Break 标志之和 | 否，属于重复汇总 |
-| <code>strategy_break_any</code> | 只要任一 Break 为 1 就取 1 | 否，属于重复汇总 |
-| <code>strategy_break_types</code> | 所有触发维度名称组成的文本 | 否，仅用于解释 |
-
-当前代码没有单独的 <code>break_shape_shift</code>，因此 Break 部分是 8 维而不是 9 维。
-
-### 4.5 最终 26 维策略画像输入
-
-主体 $i$ 在日期 $d$ 的完整报价策略画像定义为：
-
-$$
 \boxed{
-\Pi_{i,d}^{strategy}
+season\_shape\_shift_{i,m}
 =
+\sqrt{
+\frac1{21}
+\sum_u
 \left[
-Z_i^{LT},
-Z_{i,d}^{ST},
-E_{i,d}^{break}
-\right]
+V^{month}_{i,m}(u)
+-
+V_i^{LT}(u)
+\right]^2
+}
 }
 $$
 
-三个组成部分分别为：
+---
 
-| 组成 | 维数 | 正式变量 |
-|---|---:|---|
-| $Z_i^{LT}$ | 9 | <code>lt_bid_level</code><br><code>lt_adjustment_magnitude</code><br><code>lt_strategy_persistence</code><br><code>lt_quantity_hhi</code><br><code>lt_effective_segment_count</code><br><code>lt_flat_curve_rate</code><br><code>lt_tail_uplift_ratio</code><br><code>lt_curve_bend_ratio</code><br><code>lt_shape_variability</code> |
-| $Z_{i,d}^{ST}$ | 9 | <code>st_bid_level_z</code><br><code>st_adjustment_bias_z</code><br><code>st_adjustment_magnitude_z</code><br><code>st_quantity_hhi_z</code><br><code>st_effective_segment_count_z</code><br><code>st_flat_curve_rate_z</code><br><code>st_tail_uplift_ratio_z</code><br><code>st_curve_bend_ratio_z</code><br><code>st_shape_shift</code> |
-| $E_{i,d}^{break}$ | 8 | <code>break_bid_level</code><br><code>break_adjustment_bias</code><br><code>break_adjustment_magnitude</code><br><code>break_quantity_hhi</code><br><code>break_effective_segment_count</code><br><code>break_flat_curve_rate</code><br><code>break_tail_uplift_ratio</code><br><code>break_curve_bend_ratio</code> |
+# 11. 04：6 个主体级季节性摘要
 
-总维数为：
+对每个主体，在 12 个月历史条件画像上进一步压缩。
+
+定义某月份变量 $g_{i,m}$ 的跨月范围：
+
+$$
+Range_m(g_i)
+=
+\max_m g_{i,m}
+-
+\min_m g_{i,m}
+$$
+
+当前 6 个正式季节摘要：
+
+| 序号 | 字段 | 数学定义 | 含义 |
+|---:|---|---|---|
+| 1 | `season_bid_level_range` | $\max_m month\_bid\_level-\min_m month\_bid\_level$ | 报价水平季节跨度 |
+| 2 | `season_adjustment_magnitude_range` | $\max_m month\_adjustment\_magnitude-\min_m month\_adjustment\_magnitude$ | 调整幅度季节跨度 |
+| 3 | `season_quantity_hhi_range` | $\max_m month\_quantity\_hhi-\min_m month\_quantity\_hhi$ | 容量结构季节跨度 |
+| 4 | `season_effective_segment_count_range` | $\max_m month\_segment-\min_m month\_segment$ | 有效段数季节跨度 |
+| 5 | `season_tail_uplift_ratio_range` | $\max_m month\_tail-\min_m month\_tail$ | 尾部抬价季节跨度 |
+| 6 | `season_shape_shift_median` | $Median_m(season\_shape\_shift_{i,m})$ | 月份形态偏离长期原型的典型程度 |
+
+辅助字段：
+
+```text
+season_months_available
+season_nonmissing_count
+season_ready_flag
+```
+
+其中：
+
+$$
+season\_ready\_flag
+=
+\mathbf{1}
+(
+season\_nonmissing\_count\ge4
+)
+$$
+
+---
+
+# 12. 04：时段条件策略画像
+
+由 01 的 `participant × local_slot_seconds` 历史均值构建。
+
+对于时段 $h$：
 
 $$
 \boxed{
-\dim\left(\Pi_{i,d}^{strategy}\right)
+\Delta f^{ID}_{i,h}
 =
-9+9+8
-=
-26
+\bar f^{slot}_{i,h}
+-
+f_i^{LT}
 }
 $$
 
-构造预测样本时，应以 <code>participant_id</code> 将主体级 9 LT 合并到每个主体日，再与该日的 9 ST 和 8 Break 拼接。长期百分位、低/中/高状态、KMeans Cluster、完整度标志及 Break 汇总字段都不重复计入这 26 个原始策略变量。
+---
 
-下一步进行报价策略模板或完整报价曲线预测时，策略侧真正输入的是：
+## 12.1 时段条件表全部字段
+
+| 字段 | 数学定义 |
+|---|---|
+| `intraday_bid_level_delta` | $slot\_bid\_level\_mean-lt\_bid\_level$ |
+| `intraday_adjustment_magnitude_delta` | $slot\_adjustment\_magnitude\_mean-lt\_adjustment\_magnitude$ |
+| `intraday_quantity_hhi_delta` | $slot\_quantity\_hhi\_mean-lt\_quantity\_hhi$ |
+| `intraday_effective_segment_count_delta` | $slot\_effective\_segment\_count\_mean-lt\_effective\_segment\_count$ |
+| `intraday_flat_curve_rate_delta` | $slot\_flat\_curve\_flag\_mean-lt\_flat\_curve\_rate$ |
+| `intraday_tail_uplift_ratio_delta` | $slot\_tail\_uplift\_ratio\_mean-lt\_tail\_uplift\_ratio$ |
+| `intraday_curve_bend_ratio_delta` | $slot\_curve\_bend\_ratio\_mean-lt\_curve\_bend\_ratio$ |
+
+这些变量是未来模板分类器最直接的历史日内条件特征。目标时段 $h(t)$ 已知时，直接查：
 
 $$
-\Pi_{i,d}^{strategy}
+Z^{ID}_{i,h(t)}
+$$
+
+---
+
+# 13. 04：5 个主体级日内摘要
+
+对每个主体的所有历史时段 $h$ 进一步汇总。
+
+定义：
+
+$$
+Range_h(g_i)
 =
-\left[
-9\ LT,\,
-9\ ST,\,
-8\ Break
-\right]
+\max_h g_{i,h}
+-
+\min_h g_{i,h}
 $$
 
-如果再接入主体物理状态、市场状态和日历信息，完整预测关系可写为：
+当前 5 个正式日内摘要：
+
+| 序号 | 字段 | 数学定义 | 含义 |
+|---:|---|---|---|
+| 1 | `intraday_bid_level_range` | $\max_h slot\_bid\_level\_mean-\min_h slot\_bid\_level\_mean$ | 不同时段报价水平差异 |
+| 2 | `intraday_bid_level_robust_scale` | $1.4826\,\operatorname{MAD}_h(slot\_bid\_level\_mean)$ | 报价水平日内离散程度 |
+| 3 | `intraday_adjustment_magnitude_range` | $\max_h slot\_adjustment\_magnitude\_mean-\min_h(...)$ | 调整幅度日内差异 |
+| 4 | `intraday_quantity_hhi_range` | $\max_h slot\_quantity\_hhi\_mean-\min_h(...)$ | 容量结构日内差异 |
+| 5 | `intraday_switch_rate` | $\operatorname{Median}_d(daily\_curve\_switch\_rate_{i,d})$ | 主体长期典型日内策略切换频率 |
+
+其中：
 
 $$
-\widehat{\mathcal B}_{i,d+1}
+\operatorname{MAD}(x)
 =
-F\left(
-\Pi_{i,d}^{strategy},
-X_{i,d}^{physical},
-X_d^{market},
-X_d^{calendar}
+\operatorname{Median}
+\left(
+\left|x-\operatorname{Median}(x)\right|
 \right)
 $$
 
-其中 $\widehat{\mathcal B}_{i,d+1}$ 是下一目标时段或下一目标日的完整报价曲线/报价模板。
-
-8 个标量状态中至少 6 个可以正常表示、可以确认零变化或被识别为 Break 时，<code>st_ready_flag = 1</code>。当前 fast 版本先将每个主体重建到逐日历日索引，再用 rolling 窗口计算上述统计量，最后只输出原始有效交易日；该加速不会改变窗口、MAD、Break 或就绪定义。
-
----
-
-## 5. 04：构建长期 9 维解释层与辅助聚类
-
-脚本：
+辅助字段：
 
 ```text
-scripts/04_build_strategy_profile_v3_complete_case.py
+intraday_slots_available
+intraday_nonmissing_count
+intraday_ready_flag
 ```
 
-### 5.1 长期画像解释层
-
-04 处理的是完整 26 维策略画像中的长期 $Z_i^{LT}$ 部分。长期画像不是一个 Cluster，也不是多个 Cluster 的拼接标签，而是下面 9 个可分别解释的连续策略维度：
-
-各中文名称与代码字段、原始报价公式和高低值含义见第 3.1—3.12 节；本节只说明 04 如何为这些连续维度增加百分位和独立状态。
-
-```text
-报价水平
-调整幅度
-持续性
-容量集中度
-有效段数
-平价偏好
-尾部抬价
-曲线弯折
-形态波动
-```
-
-对任一长期特征 `f`，主体表保留：
-
-| 表达 | 输出列 | 说明 |
-|---|---|---|
-| 原始连续值 | `f` | 来自 02 的长期统计量，保留量纲和实际差异 |
-| 经验百分位 | `f_percentile` | 当前年度所有非缺失主体中的平均秩百分位，大于 0 且不超过 100 |
-| 独立状态 | `f_state` | 根据该维度自身的经验百分位独立划分为低、中、高 |
-
-经验百分位按：
+且：
 
 $$
-P_{i,f}=100\times\operatorname{rank}_{avg}(LT_{i,f})/N_f
-$$
-
-计算，其中并列值使用平均秩，$N_f$ 是该维度非缺失主体数。当前代码先对主体表中每个维度分别排名；`lt_ready_flag` 只用于后面的辅助聚类训练。
-
-状态规则严格对应当前代码：
-
-$$
-State_{i,f}=
-\begin{cases}
-\text{低}, & P_{i,f}\le 33.333333\\
-\text{中}, & 33.333333<P_{i,f}<66.666667\\
-\text{高}, & P_{i,f}\ge 66.666667
-\end{cases}
-$$
-
-特征缺失时，其百分位和状态也保持缺失。
-
-这里的“低 / 中 / 高”只描述该特征数值在总体中的相对位置，不代表“差 / 一般 / 好”。例如“形态波动 = 高”表示跨日形态变化更大，而不是策略质量更高。
-
-一个主体可以直接解释为：
-
-```text
-报价水平 = 高
-调整幅度 = 低
-持续性 = 高
-容量集中度 = 中
-有效段数 = 高
-平价偏好 = 低
-尾部抬价 = 高
-曲线弯折 = 中
-形态波动 = 低
-```
-
-`independent_state_fingerprint` 会把已有的 9 个独立状态拼成一行便于检索的文本，但它只是显示用指纹，不是 Cluster、Archetype 或新的组合画像分类。
-
-### 5.2 KMeans 的新定位
-
-KMeans 只回答一个辅助问题：某个特征空间中是否存在分离度和稳定性都足够高的自然分组。
-
-它分别检查四个空间：
-
-| 空间 | 特征 |
-|---|---|
-| `full_9d` | 全部 9 个长期策略维度 |
-| `price_adjustment_3d` | 报价水平、调整幅度、持续性 |
-| `quantity_structure_3d` | 容量 HHI、有效段数、平价偏好 |
-| `curve_shape_3d` | 尾部抬价、曲线弯折、形态波动 |
-
-聚类发现采用 complete-case 原则：
-
-1. 先以 `lt_ready_flag = 1` 确定发现队列；若该队列少于 50 个主体，脚本直接报错；
-2. 对每个空间分别筛选该空间全部特征均非缺失的主体；
-3. 缺少该空间任一特征的主体不会参与该空间的训练，也不会用中位数或其他方法填补；
-4. 用 complete-case 训练样本的 1% 和 99% 分位数缩尾；
-5. 使用 `RobustScaler(quantile_range=(25, 75))` 标准化；
-6. 缩尾和标准化只用于聚类副本，不覆盖画像中的原始连续值。
-
-因此四个空间可以有不同的有效样本数。`complete_discovery_n` 记录 LT-ready 队列中的空间完整样本数，`complete_all_n` 记录全部主体中的空间完整样本数。
-
-### 5.3 自动搜索与双门槛
-
-每个空间自动搜索：
-
-$$
-K=2,\ldots,6
-$$
-
-对每个可计算的 $K$：
-
-- 参考解使用 `random_state=42`、`n_init=50`；
-- 计算参考解的 Silhouette；
-- 再使用 10 个随机种子拟合，每次 `n_init=20`；
-- 计算这些结果相对参考解的 Adjusted Rand Index；
-- 以 10 个 ARI 的中位数作为稳定性指标 `median_ari`。
-
-只有同时满足：
-
-$$
-Silhouette\ge 0.40
-$$
-
-和：
-
-$$
-Median\ ARI\ge 0.80
-$$
-
-该 $K$ 才是合格候选。如果有多个合格候选，先选 Silhouette 最大者，再用 `median_ari` 打破并列。最终模型使用 `random_state=42`、`n_init=100` 重新拟合。
-
-空间被接受后，只对该空间全部特征非缺失的主体预测 Cluster。缺少任一空间特征的主体仍保持未分类：其 `*_cluster` 为空，`*_cluster_accepted = 0`。对完整主体，`*_cluster_accepted = 1`。
-
-如果某个空间没有任何 $K$ 同时通过两个门槛：
-
-- 该空间不保留聚类结果；
-- 对应的 `*_cluster` 全部为空；
-- 对应的 `*_cluster_accepted` 全部为 0；
-- 不会为了展示而强行指定类别数或命名策略类型。
-
-通过门槛时，数值 Cluster 编号仍然只是辅助分析标识，不属于主体画像定义，跨年度也不应直接按编号比较。
-
-### 5.4 04 的输出
-
-默认目录：
-
-```text
-data/processed/final_clean/strategy_profile/2025/
-```
-
-固定输出：
-
-```text
-participant_strategy_profile_2025.csv
-cluster_discovery_summary_2025.csv
-full_9d_k_selection.csv
-price_adjustment_3d_k_selection.csv
-quantity_structure_3d_k_selection.csv
-curve_shape_3d_k_selection.csv
-```
-
-`participant_strategy_profile_2025.csv` 是长期主体画像表，包含 9 个 LT 原值、9 个百分位、9 个独立状态、状态指纹及辅助聚类字段。完整 26 维动态策略输入还必须按 `participant_id` 合并 03 输出的 9 ST 和 8 Break。
-
-每个 `*_k_selection.csv` 保存该空间各候选 $K$ 的 `silhouette` 和 `median_ari`。`cluster_discovery_summary_2025.csv` 保存四个空间的 `complete_discovery_n`、`complete_all_n`、是否通过门槛、最终 $K$、质量指标、最小 Cluster 主体数和最小 Cluster 占比。
-
-只有空间被接受时，才额外生成：
-
-```text
-{space}_cluster_percentile_profile.csv
-```
-
-该文件保存各辅助 Cluster 的主体数，以及相关特征的中位经验百分位。这里的百分位在该空间的 complete-case 发现训练样本内部重新计算，不等同于主体主表中基于全部非缺失主体计算的 `*_percentile` 列。
-
----
-
-## 6. 05：验证最终画像体系
-
-脚本：
-
-```text
-scripts/05_validate_final_strategy_profile_v3_fast.py
-```
-
-该脚本验证的是“9 个独立维度 + 动态短期状态 + 辅助自然聚类发现”，不再验证旧版交叉组合画像。
-
-### 6.1 长期特征跨期稳定性
-
-对能直接映射回日级标量的 7 个 LT 特征，分别计算 1—6 月与 7—12 月主体中位数，再计算主体间 Spearman 相关系数。
-
-当前不在该项中直接检验 `lt_strategy_persistence` 和 `lt_shape_variability`，因为代码中的 `LT_DAILY_MAP` 没有把它们视为单一日级标量。
-
-输出：
-
-```text
-lt_split_half_stability.csv
-```
-
-### 6.2 长期特征冗余
-
-对 9 个 LT 特征的全部两两组合计算 Spearman 相关和绝对相关。共检查：
-
-$$
-\binom{9}{2}=36
-$$
-
-对。`summary.txt` 会统计 $|Spearman|\ge0.90$ 的高冗余特征对数量。
-
-输出：
-
-```text
-lt_feature_redundancy.csv
-```
-
-### 6.3 短期状态增量信息
-
-对 8 个日级标量，比较两种对当日值的绝对误差：
-
-- 长期基线：前 60 个日历日窗口，即 $d-67$ 到 $d-8$；
-- 近期基线：前 7 个日历日窗口，即 $d-7$ 到 $d-1$。
-
-改进比例定义为：
-
-$$
-Improvement=\frac{MAE_{long}-MAE_{recent}}{MAE_{long}}\times100\%
-$$
-
-该项当前只覆盖 `DAILY_SCALARS` 中的 8 个标量，不包含 `st_shape_shift`。
-
-新版验证脚本与 03 fast 版本一样，先重建逐日历日索引，再使用 rolling 窗口批量计算近期和长期中位数，避免对每个主体日反复扫描历史。窗口边界和最少样本要求不变。
-
-输出：
-
-```text
-st_incremental_signal.csv
-```
-
-### 6.4 独立状态覆盖
-
-逐个长期特征统计低、中、高和缺失的主体数，并同时给出：
-
-- `share_of_valid`：占该特征非缺失主体的比例；
-- `share_of_all`：占全部主体的比例。
-
-缺失状态的 `share_of_valid` 留空。由于并列秩和缺失值的存在，三种有效状态不保证机械地各占恰好三分之一。
-
-输出：
-
-```text
-independent_state_coverage.csv
-```
-
-### 6.5 所有候选 K 的完整复核
-
-对 `full_9d`、`price_adjustment_3d`、`quantity_structure_3d` 和 `curve_shape_3d` 分别复核 $K=2,\ldots,6$。每个空间只使用该空间的 complete cases，不做缺失值填补；缩尾和 `RobustScaler` 与 04 的聚类流程一致。
-
-05 的候选复核基于最终画像表中该空间的全部 complete cases；04 的发现模型则先限定 `lt_ready_flag = 1` 再取空间 complete cases。两者样本口径应结合输出中的 `complete_n`、`complete_discovery_n` 和 `complete_all_n` 阅读。
-
-每个候选 $K$ 计算：
-
-| 指标 | 输出字段 | 解释 |
-|---|---|---|
-| Silhouette | `silhouette` | 越高表示类内更紧、类间更分离 |
-| Calinski-Harabasz | `calinski_harabasz` | 越高通常表示分离结构更清晰 |
-| Davies-Bouldin | `davies_bouldin` | 越低通常越好 |
-| 多随机种子稳定性 | `median_ari` | 10 个随机种子相对参考解的 ARI 中位数 |
-| 最小/最大 Cluster 规模 | `min_cluster_count`、`max_cluster_count` | 检查分组是否极不平衡 |
-| 最小/最大 Cluster 占比 | `min_cluster_share`、`max_cluster_share` | Cluster 规模占完整样本的比例 |
-
-候选复核的参考模型使用 `random_state=42`、`n_init=100`；稳定性复核使用 10 个随机种子，每次 `n_init=20`。
-
-另外输出：
-
-```text
-small_cluster_lt_5pct_flag
-tiny_cluster_lt_2pct_flag
-```
-
-小 Cluster 只会被标记，不会自动否决，因为它可能代表真实的少数策略。需要结合相邻 $K$、分离指标和业务解释判断是少数策略还是过度切分。
-
-输出：
-
-```text
-cluster_candidate_k_review.csv
-```
-
-### 6.6 逐特征分离度
-
-对每个空间、每个候选 $K$ 和每个空间特征执行 Kruskal-Wallis 检验，并输出：
-
-```text
-kruskal_H
-kruskal_p
-epsilon_squared
-```
-
-效应量按：
-
-$$
-\epsilon^2=\max\left(0,\frac{H-k+1}{N-k}\right)
-$$
-
-计算。它用于判断 Cluster 是否真的在各个组成特征上形成实质分离，而不仅仅依赖一个总体聚类指标。
-
-输出：
-
-```text
-cluster_candidate_feature_separation.csv
-```
-
-### 6.7 04 最终选择的复核汇总
-
-`selected_cluster_review.csv` 将 04 的接受/拒绝结果与 05 的候选指标合并。对被接受空间汇总最终 $K$ 的 Silhouette、Calinski-Harabasz、Davies-Bouldin、ARI、Cluster 规模以及特征 $\epsilon^2$；对未接受空间标记 `not_accepted`。
-
-`summary.txt` 汇总长期稳定性、高冗余特征对、短期 MAE 改进和 04 最终选择。最小 Cluster 占比低于 5% 时会附加提示，但不会自动改写 04 的接受结果。
-
-默认验证目录：
-
-```text
-results/final_clean_validation/2025/
-```
-
-完整输出清单：
-
-```text
-lt_split_half_stability.csv
-lt_feature_redundancy.csv
-st_incremental_signal.csv
-independent_state_coverage.csv
-cluster_candidate_k_review.csv
-cluster_candidate_feature_separation.csv
-selected_cluster_review.csv
-summary.txt
-```
-
----
-
-## 7. 06：中文可视化
-
-脚本：
-
-```text
-scripts/06_visualize_final_strategy_profile.py
-```
-
-默认输出目录：
-
-```text
-results/final_clean_visualization/2025/
-```
-
-固定生成四张中文图：
-
-| 文件 | 内容 |
-|---|---|
-| `01_independent_feature_percentile_distributions.png` | 9 个独立长期维度的经验百分位分布 |
-| `02_participant_9d_profile_heatmap.png` | 主体 × 9 维经验百分位热图 |
-| `03_independent_feature_state_shares.png` | 每个特征低、中、高状态的有效主体占比 |
-| `04_kmeans_natural_cluster_discovery.png` | 四个空间的自然聚类是否通过双门槛 |
-
-对于每个被接受的空间，额外生成：
-
-```text
-05_{space}_accepted_cluster_heatmap.png
-```
-
-该图展示各辅助 Cluster 在相关特征上的中位经验百分位。未通过门槛的空间不会生成 Cluster 热图。
-
-脚本优先使用 `Microsoft YaHei`、`SimHei`、`Noto Sans CJK SC`、`Source Han Sans CN` 或 `Arial Unicode MS`，并以 `bbox_inches="tight"` 保存图片，减少中文标签和图例被裁切的问题。
-
-所有主图都围绕 9 个独立维度展开，不再绘制旧版组合画像数量图、组合画像 9 维热图或人为类型分布图。
-
----
-
-## 8. 运行方式
-
-先安装依赖：
-
-```powershell
-python -m pip install -r requirements.txt
-```
-
-当前仓库根目录没有 `run_all.ps1`，因此按以下顺序运行：
-
-```powershell
-python scripts\01_build_daily_strategy_core_v3.py --year 2025
-python scripts\02_build_long_term_strategy_profile.py --year 2025
-python scripts\03_build_short_term_strategy_state_fast.py --year 2025
-python scripts\04_build_strategy_profile_v3_complete_case.py --year 2025
-python scripts\05_validate_final_strategy_profile_v3_fast.py --year 2025
-python scripts\06_visualize_final_strategy_profile.py --year 2025
-```
-
-04 和 05 在导入 NumPy / scikit-learn 前使用 `setdefault` 将 `OMP_NUM_THREADS`、`MKL_NUM_THREADS`、`OPENBLAS_NUM_THREADS` 和 `LOKY_MAX_CPU_COUNT` 默认限制为 5，并屏蔽 Windows + MKL 下已知的非致命 KMeans/joblib 警告。如果运行环境已经显式设置这些变量，`setdefault` 不会覆盖现有值。
-
-各脚本可配置路径：
-
-| 脚本 | 路径参数 |
-|---|---|
-| `01_build_daily_strategy_core_v3.py` | `--raw-root`、`--out-root` |
-| `02_build_long_term_strategy_profile.py` | `--daily-root`、`--out-root` |
-| `03_build_short_term_strategy_state_fast.py` | `--daily-root`、`--out-root` |
-| `04_build_strategy_profile_v3_complete_case.py` | `--lt-root`、`--out-root` |
-| `05_validate_final_strategy_profile_v3_fast.py` | `--root`、`--results-root` |
-| `06_visualize_final_strategy_profile.py` | `--profile-root`、`--results-root` |
-
-默认依赖来自 `requirements.txt`：
-
-```text
-numpy
-pandas
-scipy
-scikit-learn
-matplotlib
-```
-
----
-
-## 9. 默认目录结构
-
-```text
-data/
-├─ raw/
-│  └─ energy_market_offers/2025/*.csv
-└─ processed/
-   └─ final_clean/
-      ├─ daily/2025/
-      │  └─ daily_strategy_core_2025.csv
-      ├─ long_term/2025/
-      │  └─ long_term_strategy_profile_2025.csv
-      ├─ short_term/2025/
-      │  └─ short_term_strategy_state_2025.csv
-      └─ strategy_profile/2025/
-         ├─ participant_strategy_profile_2025.csv
-         ├─ cluster_discovery_summary_2025.csv
-         ├─ full_9d_k_selection.csv
-         ├─ price_adjustment_3d_k_selection.csv
-         ├─ quantity_structure_3d_k_selection.csv
-         ├─ curve_shape_3d_k_selection.csv
-         └─ {space}_cluster_percentile_profile.csv  # 仅被接受空间
-
-results/
-├─ final_clean_validation/2025/
-│  ├─ lt_split_half_stability.csv
-│  ├─ lt_feature_redundancy.csv
-│  ├─ st_incremental_signal.csv
-│  ├─ independent_state_coverage.csv
-│  ├─ cluster_candidate_k_review.csv
-│  ├─ cluster_candidate_feature_separation.csv
-│  ├─ selected_cluster_review.csv
-│  └─ summary.txt
-└─ final_clean_visualization/2025/
-   ├─ 01_independent_feature_percentile_distributions.png
-   ├─ 02_participant_9d_profile_heatmap.png
-   ├─ 03_independent_feature_state_shares.png
-   ├─ 04_kmeans_natural_cluster_discovery.png
-   └─ 05_{space}_accepted_cluster_heatmap.png  # 仅被接受空间
-```
-
----
-
-## 10. 正确使用最终结果
-
-完整 26 维动态策略画像不是单独保存在一张现成 CSV 中，而是由两张表按 `participant_id` 合并：
-
-| 数据层 | 文件 | 取用字段 |
-|---|---|---|
-| 9 LT | `data/processed/final_clean/strategy_profile/2025/participant_strategy_profile_2025.csv` | 9 个原始 `lt_*` 连续值 |
-| 9 ST + 8 Break | `data/processed/final_clean/short_term/2025/short_term_strategy_state_2025.csv` | 9 个 `st_*` 状态和 8 个 `break_*` 标志 |
-
-合并后每一行代表主体 $i$ 在日期 $d$ 的完整策略状态：
-
-$$
-\Pi_{i,d}^{strategy}
+intraday\_ready\_flag
 =
-\left[
-9\ LT,
-9\ ST,
-8\ Break
-\right]
-\in\mathbb R^{26}
+\mathbf{1}
+(
+intraday\_nonmissing\_count\ge4
+)
 $$
 
-推荐使用方式：
+---
 
-- 用 9 个 LT 原始连续值表示主体长期慢变量；
-- 用 9 个 ST 表示主体截至当前日期的动态策略偏移；
-- 用 8 个 Break 表示无法由普通 z-score 表达的突变事件；
-- 用 9 个经验百分位进行跨特征尺度一致的比较、排序和画图；
-- 用 9 个独立状态进行可解释的主体描述和规则筛选；
-- 建模时不要把 LT 原值、LT 百分位和 LT 状态同时重复当作三套独立行为信息；
-- `strategy_break_count`、`strategy_break_any` 和 `strategy_break_types` 是 8 个 Break 的派生汇总，不重复计入 26 维；
-- 仅在某个空间通过 Silhouette 与 ARI 双门槛后，才把其 Cluster 作为辅助探索变量；
-- 通过门槛后，也只解释该空间全部特征非缺失主体的 Cluster；
-- 用 05 的相邻候选 $K$、Cluster 规模和逐特征 $\epsilon^2$ 复核最终选择。
+# 14. 05：日级模板状态原子
 
-不应再做以下解释：
+05 从 `bidtemplate` 历史 assignment 读取：
 
-- 不应把 KMeans Cluster 当成主体画像本身；
-- 不应把四个空间都假定为必然存在自然分类；
-- 不应在未通过双门槛时强行保留聚类标签；
-- 不应对缺失空间特征的主体填补后强行分配 Cluster；
-- 不应仅因最小 Cluster 低于 5% 就自动删除，它可能是真实少数策略；
-- 不应恢复旧版 `3×4×2` 类型体系；
-- 不应把 `independent_state_fingerprint` 当成新的组合类别；
-- 不应直接比较不同年度的数值 Cluster 编号。
+```text
+participant_id
+local_date
+template_id
+```
 
-最终原则为：
+模板 ID 可以是当前的：
+
+```text
+T00, T01, ..., FLAT
+```
+
+也可以是后续新技术路线下的：
+
+```text
+F0, F1, ..., F6
+```
+
+05 不依赖模板名称本身。
+
+设主体 $i$ 在日期 $d$ 的各模板出现次数为：
+
+$$
+n_{i,d,k}
+$$
+
+总模板观测数：
+
+$$
+N_{i,d}
+=
+\sum_k n_{i,d,k}
+$$
+
+---
+
+## 14.1 `daily_active_template_count`
 
 $$
 \boxed{
-\text{完整策略画像}
+K^{temp}_{i,d}
 =
-\text{长期慢变量}
-+
-\text{短期动态状态}
-+
-\text{Strategy Break 突变事件}
+\left|
+\{
+k:n_{i,d,k}>0
+\}
+\right|
 }
 $$
 
+字段：
+
+```text
+daily_active_template_count
+```
+
+---
+
+## 14.2 `daily_dominant_template_id`
+
 $$
 \boxed{
-\Pi_{i,d}^{strategy}
+k^*_{i,d}
 =
-\left[
-Z_i^{LT}(9),
-Z_{i,d}^{ST}(9),
-E_{i,d}^{break}(8)
-\right]
-\in\mathbb R^{26}
+\arg\max_k n_{i,d,k}
 }
 $$
+
+字段：
+
+```text
+daily_dominant_template_id
+```
+
+---
+
+## 14.3 `daily_dominant_template_share`
+
+$$
+\boxed{
+D_{i,d}
+=
+\frac{
+\max_k n_{i,d,k}
+}{
+N_{i,d}
+}
+}
+$$
+
+字段：
+
+```text
+daily_dominant_template_share
+```
+
+---
+
+## 14.4 `daily_template_entropy`
+
+令当日非零模板概率为：
+
+$$
+p_{i,d,k}
+=
+\frac{
+n_{i,d,k}
+}{
+N_{i,d}
+}
+$$
+
+非零模板种类数为 $K_{i,d}$。
+
+若：
+
+$$
+K_{i,d}\le1
+$$
+
+则：
+
+$$
+H^{day}_{i,d}=0
+$$
+
+否则：
+
+$$
+\boxed{
+H^{day}_{i,d}
+=
+-
+\frac{
+\sum_k
+p_{i,d,k}\ln p_{i,d,k}
+}{
+\ln K_{i,d}
+}
+}
+$$
+
+字段：
+
+```text
+daily_template_entropy
+```
+
+范围：
+
+$$
+H^{day}_{i,d}\in[0,1]
+$$
+
+---
+
+# 15. 05：5 个主体级策略转换特征
+
+设完整历史期内模板 $k$ 出现次数为：
+
+$$
+n_{i,k}
+$$
+
+总模板观测数：
+
+$$
+N_i
+=
+\sum_k n_{i,k}
+$$
+
+模板使用概率：
+
+$$
+p_{i,k}
+=
+\frac{
+n_{i,k}
+}{
+N_i
+}
+$$
+
+---
+
+## 15.1 正式 transition 特征表
+
+| 序号 | 字段 | 数学定义 | 含义 |
+|---:|---|---|---|
+| 1 | `transition_dominant_template_share` | $\max_k p_{i,k}$ | 主体对最常用模板的长期依赖程度 |
+| 2 | `transition_active_template_count` | $|\{k:n_{i,k}>0\}|$ | 历史使用过的模板数量 |
+| 3 | `transition_template_usage_entropy` | $H_i^{usage}$ | 全历史模板使用分布复杂度 |
+| 4 | `transition_daily_dominant_switch_rate` | $N_i^{switch}/N_i^{pair}$ | 相邻连续日主导模板发生切换的频率 |
+| 5 | `transition_pair_entropy` | $H_i^{pair}$ | 历史模板状态转移对的多样性 |
+
+---
+
+## 15.2 `transition_template_usage_entropy`
+
+若主体使用 $K_i$ 个非零模板：
+
+$$
+\boxed{
+H_i^{usage}
+=
+-
+\frac{
+\sum_k p_{i,k}\ln p_{i,k}
+}{
+\ln K_i
+}
+}
+$$
+
+若：
+
+$$
+K_i\le1
+$$
+
+则：
+
+$$
+H_i^{usage}=0
+$$
+
+---
+
+## 15.3 `transition_daily_dominant_switch_rate`
+
+只使用日期严格相邻的主导模板：
+
+$$
+d_j-d_{j-1}=1
+$$
+
+若：
+
+$$
+k^*_{i,d_j}
+\ne
+k^*_{i,d_{j-1}}
+$$
+
+记为一次 switch。
+
+设有效连续日对数量为：
+
+$$
+N_i^{pair}
+$$
+
+切换次数为：
+
+$$
+N_i^{switch}
+$$
+
+则：
+
+$$
+\boxed{
+R_i^{TR}
+=
+\frac{
+N_i^{switch}
+}{
+N_i^{pair}
+}
+}
+$$
+
+字段：
+
+```text
+transition_daily_dominant_switch_rate
+```
+
+辅助惯性：
+
+$$
+\boxed{
+transition\_daily\_dominant\_inertia
+=
+1-R_i^{TR}
+}
+$$
+
+---
+
+## 15.4 `transition_pair_entropy`
+
+定义相邻连续日模板状态对：
+
+$$
+(k^*_{i,d-1},k^*_{i,d})
+$$
+
+每种非零 transition pair 的出现次数记为：
+
+$$
+n_{i,a\rightarrow b}
+$$
+
+对应概率：
+
+$$
+p_{i,a\rightarrow b}
+=
+\frac{
+n_{i,a\rightarrow b}
+}{
+N_i^{pair}
+}
+$$
+
+若有效 transition pair 类别数为 $K_i^{pair}>1$：
+
+$$
+\boxed{
+H_i^{pair}
+=
+-
+\frac{
+\sum_{a,b}
+p_{i,a\rightarrow b}
+\ln
+p_{i,a\rightarrow b}
+}{
+\ln K_i^{pair}
+}
+}
+$$
+
+若只有一种转移对：
+
+$$
+H_i^{pair}=0
+$$
+
+字段：
+
+```text
+transition_pair_entropy
+```
+
+---
+
+## 15.5 Transition 辅助字段
+
+| 字段 | 定义 |
+|---|---|
+| `transition_dominant_template_id` | $\arg\max_k n_{i,k}$ |
+| `transition_daily_dominant_inertia` | $1-transition\_daily\_dominant\_switch\_rate$ |
+| `transition_daily_template_entropy_median` | $Median_d(H^{day}_{i,d})$ |
+| `transition_pair_count` | $N_i^{pair}$ |
+| `transition_nonmissing_count` | 5 个正式 transition 特征中非缺失个数 |
+| `transition_ready_flag` | $\mathbf{1}(transition\_nonmissing\_count\ge4)$ |
+
+---
+
+# 16. 06：最终主体级 33 维基础画像
+
+当 transition 可用时，最终主体级默认模型特征为：
+
+## 16.1 长期稳定策略：9 维
+
+```text
+lt_bid_level
+lt_adjustment_magnitude
+lt_strategy_persistence
+lt_quantity_hhi
+lt_effective_segment_count
+lt_flat_curve_rate
+lt_tail_uplift_ratio
+lt_curve_bend_ratio
+lt_shape_variability
+```
+
+## 16.2 历史短期策略倾向：8 维
+
+```text
+short_bid_level_abs_z_median
+short_bid_level_abs_z_p90
+short_bid_level_high_state_rate
+short_adjustment_magnitude_abs_z_median
+short_structure_abs_z_median
+short_shape_shift_median
+short_break_rate
+short_ready_day_share
+```
+
+## 16.3 季节性摘要：6 维
+
+```text
+season_bid_level_range
+season_adjustment_magnitude_range
+season_quantity_hhi_range
+season_effective_segment_count_range
+season_tail_uplift_ratio_range
+season_shape_shift_median
+```
+
+## 16.4 日内摘要：5 维
+
+```text
+intraday_bid_level_range
+intraday_bid_level_robust_scale
+intraday_adjustment_magnitude_range
+intraday_quantity_hhi_range
+intraday_switch_rate
+```
+
+## 16.5 策略转换：5 维
+
+```text
+transition_dominant_template_share
+transition_active_template_count
+transition_template_usage_entropy
+transition_daily_dominant_switch_rate
+transition_pair_entropy
+```
+
+因此：
+
+$$
+\boxed{
+Z_i\in\mathbb{R}^{33}
+}
+$$
+
+只是当前基础候选表示。
+
+---
+
+# 17. 预测时额外查表的 15 个历史条件特征
+
+主体级 33 维画像之外，未来目标日期和时段还分别查找：
+
+## 17.1 月份条件：8 维
+
+```text
+season_bid_level_delta
+season_adjustment_magnitude_delta
+season_quantity_hhi_delta
+season_effective_segment_count_delta
+season_flat_curve_rate_delta
+season_tail_uplift_ratio_delta
+season_curve_bend_ratio_delta
+season_shape_shift
+```
+
+## 17.2 日内条件：7 维
+
+```text
+intraday_bid_level_delta
+intraday_adjustment_magnitude_delta
+intraday_quantity_hhi_delta
+intraday_effective_segment_count_delta
+intraday_flat_curve_rate_delta
+intraday_tail_uplift_ratio_delta
+intraday_curve_bend_ratio_delta
+```
+
+因此从 `bidprofile` 侧提供给后续预测模型的完整历史行为信息可写为：
+
+$$
+\boxed{
+X^{profile}_{i,t}
+=
+[
+Z_i^{33},
+Z^{SEA}_{i,m(t)}{}^{8},
+Z^{ID}_{i,h(t)}{}^{7}
+]
+}
+$$
+
+当前共：
+
+$$
+33+8+7=48
+$$
+
+个基础候选历史行为变量。
+
+这 48 个同样不是永久固定特征集，后续仍需通过预测实验筛选。
+
+---
+
+# 18. 完整预测模型接口
+
+最新技术路线下，模板分类器输入建议写成：
+
+$$
+\boxed{
+\hat{T}_{i,t}
+=
+F_{\mathrm{cls}}
+\left(
+Z_i,\,
+Z^{\mathrm{SEA}}_{i,m(t)},\,
+Z^{\mathrm{ID}}_{i,h(t)},\,
+M_t,\,
+U_{i,t},\,
+C_t
+\right)
+}
+$$
+
+其中：
+
+- $Z_i$：主体完整历史策略画像；
+- $Z^{\mathrm{SEA}}_{i,m(t)}$：目标月份对应的历史季节画像；
+- $Z^{\mathrm{ID}}_{i,h(t)}$：目标时段对应的历史日内画像；
+- $M_t$：当前市场环境；
+- $U_{i,t}$：主体当前物理状态；
+- $C_t$：日历和时段信息。
+
+模板确定后，对模板 $k$：
+
+$$
+\boxed{
+\hat{\theta}^{(k)}_{i,t}
+=
+F_{\mathrm{reg}}^{(k)}
+\left(
+Z_i,\,
+Z^{\mathrm{SEA}}_{i,m(t)},\,
+Z^{\mathrm{ID}}_{i,h(t)},\,
+M_t,\,
+U_{i,t},\,
+C_t
+\right)
+}
+$$
+
+最终：
+
+$$
+\boxed{
+\hat{\mathcal B}_{i,t}
+=
+\operatorname{Reconstruct}
+\left(
+\hat{T}_{i,t},
+\hat{\theta}^{(\hat{T})}_{i,t}
+\right)
+}
+$$
+
+不要求：
+
+```text
+目标预测年度 recent bid lag
+目标预测年度 previous template
+目标预测年度 recent-7d ST
+```
+
+作为默认输入。
+
+---
+
+# 19. 输出目录
+
+```text
+data/processed/final_clean/
+│
+├─ daily/<year>/
+│  ├─ daily_strategy_core_<year>.csv
+│  └─ intraday_slot_core_<year>.csv
+│
+├─ long_term/<year>/
+│  └─ long_term_strategy_profile_<year>.csv
+│
+├─ short_term_history/<year>/
+│  ├─ historical_short_term_state_<year>.csv
+│  └─ historical_short_term_tendency_<year>.csv
+│
+├─ context_profile/<year>/
+│  ├─ participant_month_strategy_profile_<year>.csv
+│  ├─ seasonal_strategy_summary_<year>.csv
+│  ├─ participant_slot_strategy_profile_<year>.csv
+│  └─ intraday_strategy_summary_<year>.csv
+│
+├─ transition_profile/<year>/
+│  ├─ strategy_transition_daily_<year>.csv
+│  └─ strategy_transition_profile_<year>.csv
+│
+└─ strategy_profile/<year>/
+   ├─ participant_strategy_profile_<year>.csv
+   ├─ participant_strategy_profile_percentiles_<year>.csv
+   ├─ strategy_profile_feature_dictionary_<year>.csv
+   └─ strategy_profile_manifest_<year>.json
+```
+
+---
+
+# 20. 推荐运行顺序
+
+先构建基础历史主体画像：
+
+```powershell
+python scripts\bidprofile\01_build_daily_strategy_core.py --year 2025
+
+python scripts\bidprofile\02_build_long_term_strategy_profile.py --year 2025
+
+python scripts\bidprofile\03_build_historical_short_term_tendency.py --year 2025
+
+python scripts\bidprofile\04_build_seasonal_intraday_strategy_profile.py --year 2025
+```
+
+然后运行 `scripts/bidtemplate` 建立历史报价策略模板并得到每条历史报价的 `template_id`。
+
+随后：
+
+```powershell
+python scripts\bidprofile\05_build_strategy_transition_profile.py --year 2025
+
+python scripts\bidprofile\06_build_final_strategy_profile.py --year 2025 --require-transition
+
+python scripts\bidprofile\07_validate_strategy_profile.py --year 2025
+
+python scripts\bidprofile\08_visualize_strategy_profile.py --year 2025
+```
+
+如果模板库暂未完成，可先运行：
+
+```powershell
+python scripts\bidprofile\06_build_final_strategy_profile.py --year 2025
+```
+
+生成不含 $Z_i^{TR}$ 的基础主体画像。
+
+---
+
+# 21. 当前模块边界
+
+`bidprofile` 负责：
+
+$$
+\boxed{
+\text{历史报价}
+\rightarrow
+\text{多时间尺度主体策略画像}
+}
+$$
+
+`bidtemplate` 负责：
+
+$$
+\boxed{
+\text{历史报价曲线}
+\rightarrow
+\text{有效阶梯结构}
+\rightarrow
+\text{策略模板库}
+}
+$$
+
+后续 `bidprediction` 负责：
+
+$$
+\boxed{
+[
+主体历史画像,
+当前市场环境,
+当前主体状态,
+日历信息
+]
+\rightarrow
+模板分类
+\rightarrow
+模板专属参数回归
+\rightarrow
+报价曲线重构
+}
+$$
+
+因此，`bidprofile` 内不再通过 KMeans 给主体贴固定类型标签；聚类的核心用途转移到 `bidtemplate` 的报价结构模板发现。
+
